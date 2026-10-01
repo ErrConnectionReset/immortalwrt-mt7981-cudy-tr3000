@@ -113,7 +113,7 @@ jobs:
 
       - name: ⌨️ SSH connection to Menuconfig
         uses: owenthereal/action-upterm@v1.15.0
-        timeout-minutes: 15
+        timeout-minutes: 180
         with:
           limit-access-to-actor: true
           upterm-version: v0.29.0
