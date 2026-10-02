@@ -63,6 +63,10 @@ jobs:
     name: ⚙️ Menuconfig & Push
     if: github.event.inputs.ssh == 'true' && github.event.inputs.device != 'all'
     runs-on: ubuntu-22.04
+
+    outputs:
+      should_build: ${{ steps.build_gate.outputs.should_build }}
+
     steps:
       - name: 🙌 Checkout
         uses: actions/checkout@v4
@@ -111,13 +115,42 @@ jobs:
           cd openwrt
           $GITHUB_WORKSPACE/$DIY_P2_SH
 
+      - name: 🚦 Reset build signal
+        run: |
+          rm -f "$GITHUB_WORKSPACE/continue"
+          sudo rm -f /continue
+  
+          echo "============================================================"
+          echo " Menuconfig 操作说明"
+          echo "============================================================"
+          echo "直接 exit："
+          echo "  保存并 Push .config，但不执行 Build Firmware"
+          echo
+          echo "执行以下命令："
+          echo '  touch "$GITHUB_WORKSPACE/continue"'
+          echo "  保存并 Push .config，并继续执行 Build Firmware"
+          echo "============================================================"
+
       - name: ⌨️ SSH connection to Menuconfig
         uses: owenthereal/action-upterm@v1.15.0
         timeout-minutes: 360
         with:
           limit-access-to-actor: true
           upterm-version: v0.29.0
-          
+  
+      - name: 🚦 Check build signal
+        id: build_gate
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/continue" ] || [ -f /continue ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "✅ continue signal detected."
+            echo "➡️ Config will be saved and Build Firmware will start."
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ No continue signal detected."
+            echo "➡️ Config will be saved, but Build Firmware will be skipped."
+          fi
+  
       - name: 📤 Push config to main branch
         run: |
           SRC="/workdir/openwrt/.config"
@@ -134,18 +167,34 @@ jobs:
           git diff --cached --quiet || (
             git commit -m "Update config: ${CONFIG_FILE}" || true
             git pull --rebase origin $CURRENT_BRANCH
-            git push -f origin HEAD:$CURRENT_BRANCH
+            git push origin HEAD:$CURRENT_BRANCH
           )
+
+      - name: 📦 Pass current config to Build job
+        if: steps.build_gate.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: menuconfig-config
+          path: ${{ github.workspace }}/${{ env.CONFIG_FILE }}
+          overwrite: true
+          retention-days: 1
 
   build:
     name: 🔨 Build Firmware
     needs: menuconfig
-    if: always() && (needs.menuconfig.result == 'success' || needs.menuconfig.result == 'skipped')
+    if: ${{ !cancelled() && (needs.menuconfig.result == 'skipped' || (needs.menuconfig.result == 'success' && needs.menuconfig.outputs.should_build == 'true')) }}
     runs-on: ubuntu-22.04
     
     steps:
       - name: 🙌 Checkout
         uses: actions/checkout@v4
+
+      - name: 📥 Receive current Menuconfig config
+        if: needs.menuconfig.result == 'success' && needs.menuconfig.outputs.should_build == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: menuconfig-config
+          path: ${{ github.workspace }}/config
 
       - name: 🪠 Free Disk Space
         uses: jlumbroso/free-disk-space@main
