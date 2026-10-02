@@ -69,22 +69,99 @@ echo 1 > /sys/class/gpio/modem_power/value
 
 ## SSH 连接 Action
 
-可以通过 ssh 连接到 Action 工作流来配置 `menuconfig` 。
+可以通过 SSH 连接到 GitHub Actions 工作流，在云端执行 `make menuconfig` 并修改当前设备的编译配置。
 
-手动运行 `ImmortalWrt Builder`，选择单个设备（不能选 `all`），并勾选 SSH 选项。
-工作流使用 Upterm 公共中继提供 SSH 会话，仅允许使用触发者 GitHub 账号上的 SSH 公钥连接。
-在 `SSH connection to Menuconfig` 步骤的日志中找到 SSH 连接命令；连接后执行：
+手动运行 `ImmortalWrt Builder` 时：
+
+1. `编译设备型号` 选择单个设备，例如 `256M`、`128M` 或 `128M-Ubootmod`，不能选择 `all`。
+2. 勾选 `SSH` 选项。
+3. 启动工作流后，等待进入 `SSH connection to Menuconfig` 步骤。
+4. 在该步骤日志中找到 Upterm 提供的 SSH 连接命令并连接。
+
+工作流通过 Upterm 公共中继提供 SSH 会话，并限制为使用触发该工作流的 GitHub 账号中已配置的 SSH 公钥连接。
+
+连接后执行：
 
 ```sh
 cd /workdir/openwrt
 make menuconfig
-# 保存并退出 menuconfig 后，通知工作流继续推送配置和编译：
+```
+
+完成配置修改后，保存并退出 `menuconfig`。此时可以根据是否需要立即编译选择以下两种结束方式。
+
+### 仅保存配置，不进行编译
+
+直接退出 SSH：
+
+```sh
+exit
+```
+
+工作流随后会：
+
+```text
+保存当前 .config
+→ 更新仓库中对应的 config/*.config
+→ Push 到 main 分支
+→ 跳过 Build Firmware
+→ 正常结束工作流
+```
+
+因此，如果本次只是调整和保存 `menuconfig`，不需要再手动取消 Workflow。
+
+### 保存配置并立即继续编译
+
+执行：
+
+```sh
 touch "$GITHUB_WORKSPACE/continue"
 ```
 
-SSH 步骤最多运行 15 分钟，请在超时前保存配置并创建 `continue` 文件；直接取消运行或超时会跳过配置推送。
-如果不显示连接命令，可在 GitHub 的 Re-run jobs 中勾选 Enable debug logging，
-检查 Upterm 启动日志及到 `uptermd.upterm.dev` 的连接情况。
+请使用上面的完整命令，不建议只执行：
+
+```sh
+touch continue
+```
+
+因为后者会在当前所在目录创建文件，不一定是工作流监听的 `continue` 信号位置。
+
+检测到 `continue` 后，SSH 调试阶段会结束，工作流随后会：
+
+```text
+保存当前 .config
+→ 更新仓库中对应的 config/*.config
+→ Push 到 main 分支
+→ 将本次修改后的配置传递给 Build Firmware
+→ 在同一次 Workflow 中继续编译
+```
+
+因此现在不再需要为了使用最新 `.config` 而先运行一次 Workflow 保存配置，再启动第二次 Workflow 编译。
+
+### 关于取消 Workflow
+
+如果需要中止整个运行，可以直接在 GitHub Actions 页面使用 `Cancel workflow`。
+
+当前工作流已经对取消状态进行判断；Workflow 被取消后，尚未启动的 `Build Firmware` 不会因为 Menuconfig 阶段结束而继续启动。
+
+### SSH 会话时间
+
+`SSH connection to Menuconfig` 当前最长运行时间为 **360 分钟（6 小时）**。
+
+建议在完成配置后主动使用：
+
+```sh
+exit
+```
+
+或：
+
+```sh
+touch "$GITHUB_WORKSPACE/continue"
+```
+
+结束 SSH 阶段，而不是依赖超时。
+
+如果日志中没有显示 SSH 连接命令，可以在 GitHub 的 `Re-run jobs` 中勾选 `Enable debug logging`，然后检查 Upterm 启动日志以及到 `uptermd.upterm.dev` 的连接情况。
 
 ---
 
