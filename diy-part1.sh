@@ -55,8 +55,8 @@ cp -a \
 
 rm -rf "$FULLCONE_TMP"
 
-if [ ! -s package/network/utils/fullconenat-nft/patches/010-fix-build-with-kernel-6.12.patch ]; then
-    echo "ERROR: fullconenat-nft kernel compatibility patch download failed"
+if [ ! -s package/network/utils/fullconenat-nft/Makefile ]; then
+    echo "ERROR: fullconenat-nft Makefile import failed"
     exit 1
 fi
 
