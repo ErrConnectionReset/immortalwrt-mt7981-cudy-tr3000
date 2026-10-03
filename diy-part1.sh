@@ -55,25 +55,16 @@ cp -a \
 
 rm -rf "$FULLCONE_TMP"
 
-# Kernel 6.6.113+ changed nft_expr_ops.validate() from 3 args to 2 args.
-# The current PadavanOnly kernel is 6.6.133, so apply compatibility patch.
-mkdir -p package/network/utils/fullconenat-nft/patches
-
-wget -qO \
-  package/network/utils/fullconenat-nft/patches/010-fix-build-with-kernel-6.12.patch \
-  https://raw.githubusercontent.com/chasey-dev/immortalwrt-mt798x-rebase/master/package/network/utils/fullconenat-nft/patches/010-fix-build-with-kernel-6.12.patch
-
-if [ ! -s package/network/utils/fullconenat-nft/Makefile ]; then
-    echo "ERROR: fullconenat-nft Makefile import failed"
-    exit 1
-fi
-
 if [ ! -s package/network/utils/fullconenat-nft/patches/010-fix-build-with-kernel-6.12.patch ]; then
     echo "ERROR: fullconenat-nft kernel compatibility patch download failed"
     exit 1
 fi
 
 echo "fullconenat-nft package imported successfully."
+
+echo "Included patches:"
+find package/network/utils/fullconenat-nft/patches \
+  -maxdepth 1 -type f -print 2>/dev/null || true
 
 git clone https://github.com/eamonxg/luci-theme-aurora package/luci-theme-aurora
 git clone https://github.com/eamonxg/luci-app-aurora-config package/luci-app-aurora-config
