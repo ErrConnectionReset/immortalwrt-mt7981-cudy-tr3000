@@ -2,6 +2,7 @@ name: ImmortalWrt Builder
 
 permissions:
   contents: write
+  actions: write
 
 on:
   repository_dispatch:
