@@ -117,3 +117,24 @@ chmod 0755 "$DEFAULT_THEME_SCRIPT"
 
 echo "Default LuCI theme fallback script installed:"
 echo "  Argon -> Aurora -> Material -> OpenWrt 2020 -> OpenWrt -> Bootstrap"
+
+# ============================================================
+# libxcrypt 4.4.36 / fortify-headers compatibility
+# Avoid -Werror=format-nonliteral breaking the build.
+# ============================================================
+
+LIBXCRYPT_MK="feeds/packages/libs/libxcrypt/Makefile"
+
+if [ -f "$LIBXCRYPT_MK" ]; then
+    if grep -q -- '--disable-werror' "$LIBXCRYPT_MK"; then
+        echo "OK: libxcrypt already has --disable-werror"
+    else
+        sed -i \
+            '/^include .*package\.mk$/a CONFIGURE_ARGS += --disable-werror' \
+            "$LIBXCRYPT_MK"
+
+        echo "OK: libxcrypt compatibility applied: --disable-werror"
+    fi
+else
+    echo "INFO: libxcrypt Makefile not found, compatibility patch skipped"
+fi
