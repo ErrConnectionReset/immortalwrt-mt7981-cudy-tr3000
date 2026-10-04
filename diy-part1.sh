@@ -260,15 +260,6 @@ echo "No LinkEase feed was added to feeds.conf.default."
 #
 # Minimal source import only.
 # No additional full feeds are added to feeds.conf.default.
-#
-#   PartExp:
-#     https://github.com/sirpdboy/luci-app-partexp
-#
-#   SMART Info:
-#     https://github.com/huajijam/luci-app-smartinfo
-#
-#   File Transfer:
-#     https://github.com/DustReliant/luci-app-filetransfer
 # ============================================================
 
 echo "============================================================"
