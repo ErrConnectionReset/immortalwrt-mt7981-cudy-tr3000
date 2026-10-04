@@ -255,6 +255,214 @@ echo
 echo "Minimal LinkEase QuickStart import completed successfully."
 echo "No LinkEase feed was added to feeds.conf.default."
 
+# ============================================================
+# Import selected third-party LuCI applications
+#
+# Minimal source import only.
+# No additional full feeds are added to feeds.conf.default.
+#
+#   PartExp:
+#     https://github.com/sirpdboy/luci-app-partexp
+#
+#   SMART Info:
+#     https://github.com/huajijam/luci-app-smartinfo
+#
+#   File Transfer:
+#     https://github.com/DustReliant/luci-app-filetransfer
+# ============================================================
+
+echo "============================================================"
+echo " Importing selected third-party LuCI applications"
+echo "============================================================"
+
+THIRDPARTY_DST="package/custom/thirdparty-luci"
+
+mkdir -p "$THIRDPARTY_DST"
+
+# ============================================================
+# Helper: refuse to silently overwrite an existing package
+# ============================================================
+
+check_package_conflict() {
+    local pkg="$1"
+    local expected="$2"
+    local existing
+
+    existing="$(
+        find package \
+            -type f \
+            -name Makefile \
+            ! -path "${expected}/*" \
+            -exec grep -l -E \
+                "(PKG_NAME[[:space:]]*:?=[[:space:]]*${pkg}|Package/${pkg}([[:space:]]|$))" \
+                {} + 2>/dev/null \
+            | head -n 1 || true
+    )"
+
+    if [ -n "$existing" ]; then
+        echo "ERROR: package '$pkg' already exists:"
+        echo "  $existing"
+        echo "Refusing to import another copy."
+        exit 1
+    fi
+}
+
+# ============================================================
+# 1. luci-app-partexp
+#
+# The sirpdboy repository contains the actual OpenWrt package
+# inside the nested luci-app-partexp/ directory, so import only
+# that directory instead of the complete repository.
+# ============================================================
+
+PARTEXP_DST="$THIRDPARTY_DST/luci-app-partexp"
+
+check_package_conflict \
+    "luci-app-partexp" \
+    "$PARTEXP_DST"
+
+PARTEXP_TMP="$(mktemp -d)"
+
+git clone \
+    --depth 1 \
+    --filter=blob:none \
+    --sparse \
+    -b main \
+    https://github.com/sirpdboy/luci-app-partexp.git \
+    "$PARTEXP_TMP"
+
+git -C "$PARTEXP_TMP" sparse-checkout set \
+    luci-app-partexp
+
+if [ ! -s "$PARTEXP_TMP/luci-app-partexp/Makefile" ]; then
+    echo "ERROR: luci-app-partexp Makefile import failed"
+    rm -rf "$PARTEXP_TMP"
+    exit 1
+fi
+
+rm -rf "$PARTEXP_DST"
+cp -a \
+    "$PARTEXP_TMP/luci-app-partexp" \
+    "$PARTEXP_DST"
+
+rm -rf "$PARTEXP_TMP"
+
+echo "OK: luci-app-partexp imported"
+
+
+# ============================================================
+# 2. luci-app-smartinfo
+#
+# Upstream repository itself is already an OpenWrt package.
+# Only dependency: smartmontools.
+# ============================================================
+
+SMARTINFO_DST="$THIRDPARTY_DST/luci-app-smartinfo"
+
+check_package_conflict \
+    "luci-app-smartinfo" \
+    "$SMARTINFO_DST"
+
+SMARTINFO_TMP="$(mktemp -d)"
+
+git clone \
+    --depth 1 \
+    --filter=blob:none \
+    -b main \
+    https://github.com/huajijam/luci-app-smartinfo.git \
+    "$SMARTINFO_TMP"
+
+if [ ! -s "$SMARTINFO_TMP/Makefile" ]; then
+    echo "ERROR: luci-app-smartinfo Makefile import failed"
+    rm -rf "$SMARTINFO_TMP"
+    exit 1
+fi
+
+rm -rf "$SMARTINFO_DST"
+mkdir -p "$SMARTINFO_DST"
+
+rm -rf "$SMARTINFO_TMP/.git"
+
+cp -a \
+    "$SMARTINFO_TMP/." \
+    "$SMARTINFO_DST/"
+
+rm -rf "$SMARTINFO_TMP"
+
+echo "OK: luci-app-smartinfo imported"
+
+
+# ============================================================
+# 3. luci-app-filetransfer
+#
+# Use the maintained standalone version instead of the old
+# luci-lib-fs based implementation.
+#
+# Dependencies:
+#   luci-base
+#   luci-lib-jsonc
+#   luci-lib-nixio
+# ============================================================
+
+FILETRANSFER_DST="$THIRDPARTY_DST/luci-app-filetransfer"
+
+check_package_conflict \
+    "luci-app-filetransfer" \
+    "$FILETRANSFER_DST"
+
+FILETRANSFER_TMP="$(mktemp -d)"
+
+git clone \
+    --depth 1 \
+    --filter=blob:none \
+    -b master \
+    https://github.com/DustReliant/luci-app-filetransfer.git \
+    "$FILETRANSFER_TMP"
+
+if [ ! -s "$FILETRANSFER_TMP/Makefile" ]; then
+    echo "ERROR: luci-app-filetransfer Makefile import failed"
+    rm -rf "$FILETRANSFER_TMP"
+    exit 1
+fi
+
+rm -rf "$FILETRANSFER_DST"
+mkdir -p "$FILETRANSFER_DST"
+
+rm -rf "$FILETRANSFER_TMP/.git"
+
+cp -a \
+    "$FILETRANSFER_TMP/." \
+    "$FILETRANSFER_DST/"
+
+rm -rf "$FILETRANSFER_TMP"
+
+echo "OK: luci-app-filetransfer imported"
+
+
+# ============================================================
+# Final verification
+# ============================================================
+
+echo
+echo "Third-party LuCI package verification:"
+
+for pkg in \
+    luci-app-partexp \
+    luci-app-smartinfo \
+    luci-app-filetransfer
+do
+    if [ ! -s "$THIRDPARTY_DST/$pkg/Makefile" ]; then
+        echo "ERROR: missing Makefile for '$pkg'"
+        exit 1
+    fi
+
+    echo "  OK: $THIRDPARTY_DST/$pkg"
+done
+
+echo
+echo "Selected third-party LuCI applications imported successfully."
+echo "No additional feed was added."
+
 git clone https://github.com/eamonxg/luci-theme-aurora package/luci-theme-aurora
 git clone https://github.com/eamonxg/luci-app-aurora-config package/luci-app-aurora-config
 git clone https://github.com/timsaya/luci-app-bandix package/luci-app-bandix
