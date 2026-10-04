@@ -351,92 +351,102 @@ echo "OK: luci-app-partexp imported"
 
 
 # ============================================================
-# 2. luci-app-smartinfo
+# 2. luci-app-filetransfer + luci-lib-fs
 #
-# Upstream repository itself is already an OpenWrt package.
-# Only dependency: smartmontools.
-# ============================================================
-
-SMARTINFO_DST="$THIRDPARTY_DST/luci-app-smartinfo"
-
-check_package_conflict \
-    "luci-app-smartinfo" \
-    "$SMARTINFO_DST"
-
-SMARTINFO_TMP="$(mktemp -d)"
-
-git clone \
-    --depth 1 \
-    --filter=blob:none \
-    -b main \
-    https://github.com/huajijam/luci-app-smartinfo.git \
-    "$SMARTINFO_TMP"
-
-if [ ! -s "$SMARTINFO_TMP/Makefile" ]; then
-    echo "ERROR: luci-app-smartinfo Makefile import failed"
-    rm -rf "$SMARTINFO_TMP"
-    exit 1
-fi
-
-rm -rf "$SMARTINFO_DST"
-mkdir -p "$SMARTINFO_DST"
-
-rm -rf "$SMARTINFO_TMP/.git"
-
-cp -a \
-    "$SMARTINFO_TMP/." \
-    "$SMARTINFO_DST/"
-
-rm -rf "$SMARTINFO_TMP"
-
-echo "OK: luci-app-smartinfo imported"
-
-
-# ============================================================
-# 3. luci-app-filetransfer
+# Source:
+#   https://github.com/coolsnowwolf/luci
 #
-# Use the maintained standalone version instead of the old
-# luci-lib-fs based implementation.
+# luci-app-filetransfer is the classic Lean/LEDE implementation.
 #
 # Dependencies:
-#   luci-base
-#   luci-lib-jsonc
-#   luci-lib-nixio
+#   luci-app-filetransfer
+#       -> luci-compat
+#       -> luci-lib-fs
+#            -> luci-lib-nixio
+#
+# Import both application and legacy luci-lib-fs from the same
+# upstream repository instead of adding another full feed.
 # ============================================================
 
 FILETRANSFER_DST="$THIRDPARTY_DST/luci-app-filetransfer"
+LUCIFS_DST="$THIRDPARTY_DST/luci-lib-fs"
 
 check_package_conflict \
     "luci-app-filetransfer" \
     "$FILETRANSFER_DST"
 
-FILETRANSFER_TMP="$(mktemp -d)"
+check_package_conflict \
+    "luci-lib-fs" \
+    "$LUCIFS_DST"
+
+LEAN_LUCI_TMP="$(mktemp -d)"
 
 git clone \
     --depth 1 \
     --filter=blob:none \
+    --sparse \
     -b master \
-    https://github.com/DustReliant/luci-app-filetransfer.git \
-    "$FILETRANSFER_TMP"
+    https://github.com/coolsnowwolf/luci.git \
+    "$LEAN_LUCI_TMP"
 
-if [ ! -s "$FILETRANSFER_TMP/Makefile" ]; then
-    echo "ERROR: luci-app-filetransfer Makefile import failed"
-    rm -rf "$FILETRANSFER_TMP"
+git -C "$LEAN_LUCI_TMP" sparse-checkout set \
+    applications/luci-app-filetransfer \
+    libs/luci-lib-fs
+
+if [ ! -s "$LEAN_LUCI_TMP/applications/luci-app-filetransfer/Makefile" ]; then
+    echo "ERROR: coolsnowwolf luci-app-filetransfer import failed"
+    rm -rf "$LEAN_LUCI_TMP"
     exit 1
 fi
 
-rm -rf "$FILETRANSFER_DST"
-mkdir -p "$FILETRANSFER_DST"
+if [ ! -s "$LEAN_LUCI_TMP/libs/luci-lib-fs/Makefile" ]; then
+    echo "ERROR: coolsnowwolf luci-lib-fs import failed"
+    rm -rf "$LEAN_LUCI_TMP"
+    exit 1
+fi
 
-rm -rf "$FILETRANSFER_TMP/.git"
+rm -rf \
+    "$FILETRANSFER_DST" \
+    "$LUCIFS_DST"
 
 cp -a \
-    "$FILETRANSFER_TMP/." \
-    "$FILETRANSFER_DST/"
+    "$LEAN_LUCI_TMP/applications/luci-app-filetransfer" \
+    "$FILETRANSFER_DST"
 
-rm -rf "$FILETRANSFER_TMP"
+cp -a \
+    "$LEAN_LUCI_TMP/libs/luci-lib-fs" \
+    "$LUCIFS_DST"
 
-echo "OK: luci-app-filetransfer imported"
+rm -rf "$LEAN_LUCI_TMP"
+
+# ------------------------------------------------------------
+# The original coolsnowwolf package lives inside the luci repo
+# and therefore uses:
+#
+#   include ../../luci.mk
+#
+# After copying it into package/custom/thirdparty-luci this
+# relative path is no longer valid. Point it at the normal
+# LuCI feed makefile instead.
+# ------------------------------------------------------------
+
+sed -i \
+    's#^include ../../luci\.mk$#include $(TOPDIR)/feeds/luci/luci.mk#' \
+    "$FILETRANSFER_DST/Makefile"
+
+# ------------------------------------------------------------
+# This is an old Lua/CBI LuCI application. On modern 24.10 LuCI,
+# explicitly depend on luci-compat so its old controller / CBI
+# implementation has the compatibility runtime it expects.
+# Keep the original luci-lib-fs dependency.
+# ------------------------------------------------------------
+
+sed -i \
+    's#^LUCI_DEPENDS:=+luci-lib-fs$#LUCI_DEPENDS:=+luci-compat +luci-lib-fs#' \
+    "$FILETRANSFER_DST/Makefile"
+
+echo "OK: coolsnowwolf luci-app-filetransfer imported"
+echo "OK: coolsnowwolf luci-lib-fs imported"
 
 
 # ============================================================
