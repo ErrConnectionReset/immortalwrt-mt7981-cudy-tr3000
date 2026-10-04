@@ -422,6 +422,29 @@ cp -a \
 rm -rf "$LEAN_LUCI_TMP"
 
 # ------------------------------------------------------------
+# Adapt legacy LuCI Simplified Chinese translation directory.
+#
+# coolsnowwolf/luci-app-filetransfer still uses:
+#   po/zh-cn/
+#
+# Modern LuCI build system uses:
+#   po/zh_Hans/
+#
+# The generated package name remains:
+#   luci-i18n-filetransfer-zh-cn
+# ------------------------------------------------------------
+
+if [ -d "$FILETRANSFER_DST/po/zh-cn" ] && \
+   [ ! -e "$FILETRANSFER_DST/po/zh_Hans" ]; then
+
+    mv \
+        "$FILETRANSFER_DST/po/zh-cn" \
+        "$FILETRANSFER_DST/po/zh_Hans"
+
+    echo "OK: FileTransfer translation adapted: zh-cn -> zh_Hans"
+fi
+
+# ------------------------------------------------------------
 # The original coolsnowwolf package lives inside the luci repo
 # and therefore uses:
 #
