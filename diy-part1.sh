@@ -260,6 +260,17 @@ echo "No LinkEase feed was added to feeds.conf.default."
 #
 # Minimal source import only.
 # No additional full feeds are added to feeds.conf.default.
+#
+#   PartExp:
+#     https://github.com/sirpdboy/luci-app-partexp
+#
+#   File Transfer:
+#     https://github.com/coolsnowwolf/luci
+#     applications/luci-app-filetransfer
+#
+#   Legacy dependency for File Transfer:
+#     https://github.com/coolsnowwolf/luci
+#     libs/luci-lib-fs
 # ============================================================
 
 echo "============================================================"
@@ -449,7 +460,8 @@ echo "Third-party LuCI package verification:"
 
 for pkg in \
     luci-app-partexp \
-    luci-app-filetransfer
+    luci-app-filetransfer \
+    luci-lib-fs
 do
     if [ ! -s "$THIRDPARTY_DST/$pkg/Makefile" ]; then
         echo "ERROR: missing Makefile for '$pkg'"
