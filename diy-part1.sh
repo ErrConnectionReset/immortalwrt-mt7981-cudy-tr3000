@@ -458,7 +458,6 @@ echo "Third-party LuCI package verification:"
 
 for pkg in \
     luci-app-partexp \
-    luci-app-smartinfo \
     luci-app-filetransfer
 do
     if [ ! -s "$THIRDPARTY_DST/$pkg/Makefile" ]; then
