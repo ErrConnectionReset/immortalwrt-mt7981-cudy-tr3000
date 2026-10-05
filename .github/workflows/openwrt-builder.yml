@@ -70,7 +70,7 @@ jobs:
 
     steps:
       - name: 🙌 Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 🛠️ Init Environment
         run: |
@@ -173,7 +173,7 @@ jobs:
 
       - name: 📦 Pass current config to Build job
         if: steps.build_gate.outputs.should_build == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: menuconfig-config
           path: ${{ github.workspace }}/${{ env.CONFIG_FILE }}
@@ -188,11 +188,11 @@ jobs:
     
     steps:
       - name: 🙌 Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 📥 Receive current Menuconfig config
         if: needs.menuconfig.result == 'success' && needs.menuconfig.outputs.should_build == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: menuconfig-config
           path: ${{ github.workspace }}/config
@@ -226,7 +226,7 @@ jobs:
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
       - name: ⚙️ Setup ccache & DL cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             /workdir/.ccache
@@ -304,7 +304,7 @@ jobs:
           echo "status=success" >> $GITHUB_OUTPUT
 
       - name: 🪄 Upload Binaries (Artifacts)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         if: steps.compile.outputs.status == 'success'
         with:
           name: ImmortalWrt_Combined_${{ env.DEVICE_INPUT }}_${{ env.REPO_BRANCH }}
