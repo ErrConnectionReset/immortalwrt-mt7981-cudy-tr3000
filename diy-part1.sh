@@ -229,6 +229,47 @@ done
 rm -rf "$QUICKSTART_ISTORE_TMP"
 
 # ============================================================
+# Disable system-level iStore compatibility feed by default
+#
+# Keep QuickStart / luci-app-store and iStore's private
+# is-opkg repository mechanism intact.
+#
+# Only disable:
+#   /etc/opkg/compatfeeds.conf -> istore_compat
+#
+# This prevents iStore dummy compatibility packages such as
+# kmod-ipt-socket / kmod-inet-diag from participating in the
+# normal system opkg package selection.
+# ============================================================
+
+ISTORE_COMPAT_DISABLE_SCRIPT="$QUICKSTART_DST/luci-app-store/root/etc/uci-defaults/99-disable-istore-compat"
+
+mkdir -p "$(dirname "$ISTORE_COMPAT_DISABLE_SCRIPT")"
+
+cat > "$ISTORE_COMPAT_DISABLE_SCRIPT" <<'EOF'
+#!/bin/sh
+
+CONF="/etc/opkg/compatfeeds.conf"
+
+if [ -f "$CONF" ]; then
+    sed -i \
+        's#^[[:space:]]*src/gz[[:space:]][[:space:]]*istore_compat[[:space:]][[:space:]]*#\# src/gz istore_compat #' \
+        "$CONF"
+fi
+
+# Remove a possible stale system-level package index.
+rm -f \
+    /var/opkg-lists/istore_compat \
+    /var/opkg-lists/istore_compat.sig
+
+exit 0
+EOF
+
+chmod 0755 "$ISTORE_COMPAT_DISABLE_SCRIPT"
+
+echo "OK: system-level istore_compat feed will be disabled by default"
+
+# ============================================================
 # Final verification
 # ============================================================
 
