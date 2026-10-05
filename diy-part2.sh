@@ -138,3 +138,49 @@ if [ -f "$LIBXCRYPT_MK" ]; then
 else
     echo "INFO: libxcrypt Makefile not found, compatibility patch skipped"
 fi
+
+# ============================================================
+# smartmontools local drive database
+#
+# KIOXIA EXCERIA PLUS Portable SSD
+# USB bridge ID:
+#   30de:1000
+#
+# Force smartmontools to use the JMicron NVMe bridge backend:
+#   -d sntjmicron
+#
+# This allows:
+#   smartctl -a /dev/sda
+#
+# instead of requiring:
+#   smartctl -a -d sntjmicron /dev/sda
+#
+# Use /etc/smart_drivedb.h instead of modifying the packaged
+# /usr/share/smartmontools/drivedb.h, so package/database
+# updates do not overwrite the local device mapping.
+# ============================================================
+
+SMART_DRIVEDB="files/etc/smart_drivedb.h"
+
+mkdir -p "$(dirname "$SMART_DRIVEDB")"
+
+if [ ! -f "$SMART_DRIVEDB" ]; then
+    touch "$SMART_DRIVEDB"
+fi
+
+if ! grep -qF '"0x30de:0x1000"' "$SMART_DRIVEDB"; then
+    cat >> "$SMART_DRIVEDB" <<'EOF'
+
+{
+  "USB: KIOXIA EXCERIA PLUS; ",
+  "0x30de:0x1000",
+  "",
+  "",
+  "-d sntjmicron"
+},
+EOF
+
+    echo "OK: KIOXIA EXCERIA PLUS SMART USB bridge mapping added"
+else
+    echo "OK: KIOXIA EXCERIA PLUS SMART USB bridge mapping already exists"
+fi
