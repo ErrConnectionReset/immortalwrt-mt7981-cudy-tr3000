@@ -310,40 +310,429 @@ jobs:
           name: ImmortalWrt_Combined_${{ env.DEVICE_INPUT }}_${{ env.REPO_BRANCH }}
           path: ${{ github.workspace }}/firmware_collection/*
 
-      - name: 📌 Generate Release Tag
+      - name: 📌 Generate Release Tag & Config Changelog
         id: tag
         if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          BUILD_TIME=$(date +"%Y%m%d-%H%M")
+          # ============================================================
+          # 1. Generate Release tag
+          #    Format: ImmortalWrt-YYYYMMDDHHMM
+          # ============================================================
+          BUILD_TIME="$(date +"%Y%m%d%H%M")"
           RELEASE_TAG="ImmortalWrt-${BUILD_TIME}"
-          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
 
-          cat > release.txt << EOF
-          ## 📦 ImmortalWrt Firmware Release
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
-          **🏷️ Release:** $RELEASE_TAG
-          **🌿 Branch:** $REPO_BRANCH
-          **📱 Device:** ${DEVICE_INPUT}
-          **📅 Build Date:** $(date +"%Y-%m-%d %H:%M:%S")
-          **🔨 Compiler:** GCC with ccache
+          echo "============================================================"
+          echo " Release Tag: $RELEASE_TAG"
+          echo "============================================================"
 
-          ## 📥 Download
+          # ============================================================
+          # 2. Save an exact snapshot of the repository configs
+          #
+          # This snapshot is uploaded together with the Release.
+          # Future Releases will compare against this snapshot instead
+          # of relying only on the Git tag.
+          # ============================================================
+          CURRENT_SNAPSHOT="$GITHUB_WORKSPACE/firmware_collection/release-configs.tar.gz"
 
-          Download the firmware files from the assets below.
+          SNAPSHOT_FILES=()
 
-          ---
+          for FILE in \
+              config/256m.config \
+              config/128m.config \
+              config/128muboot.config
+          do
+              if [ -f "$GITHUB_WORKSPACE/$FILE" ]; then
+                  SNAPSHOT_FILES+=("$FILE")
+              fi
+          done
 
-          Built with ❤️ using [GitHub Actions](https://github.com/features/actions)
-          EOF
+          if [ "${#SNAPSHOT_FILES[@]}" -gt 0 ]; then
+              tar -czf "$CURRENT_SNAPSHOT" \
+                  -C "$GITHUB_WORKSPACE" \
+                  "${SNAPSHOT_FILES[@]}"
 
-          echo "status=success" >> $GITHUB_OUTPUT
+              echo "✅ Config snapshot created:"
+              echo "   $CURRENT_SNAPSHOT"
+          else
+              echo "⚠️ No config files found for Release snapshot."
+          fi
+
+          # ============================================================
+          # 3. Find previous ImmortalWrt Release
+          # ============================================================
+          PREV_TAG="$(
+              gh release list \
+                  --limit 100 \
+                  --json tagName \
+                  --jq '[.[] | select(.tagName | startswith("ImmortalWrt-"))][0].tagName // ""' \
+                  2>/dev/null || true
+          )"
+
+          if [ -n "$PREV_TAG" ]; then
+              echo "✅ Previous Release found: $PREV_TAG"
+          else
+              echo "ℹ️ No previous ImmortalWrt Release found."
+          fi
+
+          # ============================================================
+          # 4. Try to download exact config snapshot from previous
+          #    Release.
+          #
+          # For old Releases created before this feature existed,
+          # fall back to reading config files from the old Release tag.
+          # ============================================================
+          PREV_ROOT="$RUNNER_TEMP/previous-release"
+          PREV_EXTRACTED="$PREV_ROOT/extracted"
+
+          mkdir -p "$PREV_EXTRACTED"
+
+          PREV_SNAPSHOT_OK=false
+
+          if [ -n "$PREV_TAG" ]; then
+              if gh release download "$PREV_TAG" \
+                  --pattern "release-configs.tar.gz" \
+                  --dir "$PREV_ROOT" \
+                  >/dev/null 2>&1
+              then
+                  if tar -xzf \
+                      "$PREV_ROOT/release-configs.tar.gz" \
+                      -C "$PREV_EXTRACTED"
+                  then
+                      PREV_SNAPSHOT_OK=true
+                      echo "✅ Previous Release config snapshot downloaded."
+                  fi
+              fi
+
+              # Old Releases do not yet have release-configs.tar.gz.
+              # Fetch the old tag as a compatibility fallback.
+              if [ "$PREV_SNAPSHOT_OK" != "true" ]; then
+                  echo "ℹ️ Previous Release has no config snapshot."
+                  echo "➡️ Falling back to config stored at Release tag."
+
+                  git fetch --force origin \
+                      "refs/tags/${PREV_TAG}:refs/tags/${PREV_TAG}" \
+                      >/dev/null 2>&1 || true
+              fi
+          fi
+
+          # ============================================================
+          # 5. Start Release Notes
+          # ============================================================
+          {
+              echo "## 📦 ImmortalWrt Firmware Release"
+              echo
+              echo "**🏷️ Release:** \`$RELEASE_TAG\`"
+              echo
+              echo "**🌿 Branch:** \`$REPO_BRANCH\`"
+              echo
+              echo "**📱 Device:** \`${DEVICE_INPUT}\`"
+              echo
+              echo "**📅 Build Date:** $(date +"%Y-%m-%d %H:%M:%S")"
+              echo
+              echo "**🔨 Compiler:** GCC with ccache"
+              echo
+
+              if [ -n "$PREV_TAG" ]; then
+                  echo "**🔁 Compared with:** \`$PREV_TAG\`"
+              else
+                  echo "**🔁 Compared with:** No previous ImmortalWrt Release"
+              fi
+
+              echo
+              echo "---"
+              echo
+              echo "## 🔄 Configuration Changes"
+              echo
+          } > "$GITHUB_WORKSPACE/release.txt"
+
+          # ============================================================
+          # 6. Decide which configs belong to this build
+          # ============================================================
+          case "$DEVICE_INPUT" in
+              "all")
+                  CONFIGS=(
+                      "config/256m.config"
+                      "config/128m.config"
+                      "config/128muboot.config"
+                  )
+                  ;;
+              "256M")
+                  CONFIGS=("config/256m.config")
+                  ;;
+              "128M")
+                  CONFIGS=("config/128m.config")
+                  ;;
+              "128M-Ubootmod")
+                  CONFIGS=("config/128muboot.config")
+                  ;;
+              *)
+                  echo "❌ Unknown DEVICE_INPUT: $DEVICE_INPUT"
+                  exit 1
+                  ;;
+          esac
+
+          # ============================================================
+          # Helper: convert config filename to readable device name
+          # ============================================================
+          config_device_name() {
+              case "$1" in
+                  "config/256m.config")
+                      echo "256M"
+                      ;;
+                  "config/128m.config")
+                      echo "128M"
+                      ;;
+                  "config/128muboot.config")
+                      echo "128M-Ubootmod"
+                      ;;
+                  *)
+                      echo "$1"
+                      ;;
+              esac
+          }
+
+          # ============================================================
+          # 7. Compare every relevant config
+          # ============================================================
+          for CONFIG in "${CONFIGS[@]}"; do
+              CURRENT_CONFIG="$GITHUB_WORKSPACE/$CONFIG"
+              DEVICE_NAME="$(config_device_name "$CONFIG")"
+
+              {
+                  echo "### 📱 $DEVICE_NAME"
+                  echo
+              } >> "$GITHUB_WORKSPACE/release.txt"
+
+              if [ ! -f "$CURRENT_CONFIG" ]; then
+                  echo "⚠️ Current config not found: \`$CONFIG\`" \
+                      >> "$GITHUB_WORKSPACE/release.txt"
+                  echo >> "$GITHUB_WORKSPACE/release.txt"
+                  continue
+              fi
+
+              OLD_CONFIG="$RUNNER_TEMP/previous-$(basename "$CONFIG")"
+              COMPARE_SOURCE=""
+
+              # --------------------------------------------------------
+              # Preferred method:
+              # exact snapshot from previous Release
+              # --------------------------------------------------------
+              if [ "$PREV_SNAPSHOT_OK" = "true" ] && \
+                 [ -f "$PREV_EXTRACTED/$CONFIG" ]
+              then
+                  cp -f "$PREV_EXTRACTED/$CONFIG" "$OLD_CONFIG"
+                  COMPARE_SOURCE="Previous Release config snapshot"
+
+              # --------------------------------------------------------
+              # Compatibility fallback for old Releases
+              # --------------------------------------------------------
+              elif [ -n "$PREV_TAG" ] && \
+                   git show "${PREV_TAG}:${CONFIG}" \
+                       > "$OLD_CONFIG" 2>/dev/null
+              then
+                  COMPARE_SOURCE="Previous Release tag (legacy fallback)"
+              else
+                  echo "_No comparable previous config is available._" \
+                      >> "$GITHUB_WORKSPACE/release.txt"
+                  echo >> "$GITHUB_WORKSPACE/release.txt"
+                  continue
+              fi
+
+              echo "> Comparison source: $COMPARE_SOURCE" \
+                  >> "$GITHUB_WORKSPACE/release.txt"
+              echo >> "$GITHUB_WORKSPACE/release.txt"
+
+              # --------------------------------------------------------
+              # No changes
+              # --------------------------------------------------------
+              if cmp -s "$OLD_CONFIG" "$CURRENT_CONFIG"; then
+                  echo "✅ No configuration changes." \
+                      >> "$GITHUB_WORKSPACE/release.txt"
+                  echo >> "$GITHUB_WORKSPACE/release.txt"
+                  continue
+              fi
+
+              BASE_NAME="$(basename "$CONFIG")"
+
+              OLD_PACKAGES="$RUNNER_TEMP/${BASE_NAME}.old-packages"
+              NEW_PACKAGES="$RUNNER_TEMP/${BASE_NAME}.new-packages"
+
+              ADDED_PACKAGES="$RUNNER_TEMP/${BASE_NAME}.added-packages"
+              REMOVED_PACKAGES="$RUNNER_TEMP/${BASE_NAME}.removed-packages"
+
+              OTHER_CHANGES="$RUNNER_TEMP/${BASE_NAME}.other-changes"
+              FULL_DIFF="$RUNNER_TEMP/${BASE_NAME}.full-diff"
+
+              # --------------------------------------------------------
+              # Extract selected OpenWrt packages.
+              #
+              # Treat both =y and =m as selected packages.
+              # --------------------------------------------------------
+              awk -F= '
+                  $1 ~ /^CONFIG_PACKAGE_/ && ($2 == "y" || $2 == "m") {
+                      sub(/^CONFIG_PACKAGE_/, "", $1)
+                      print $1
+                  }
+              ' "$OLD_CONFIG" | sort -u > "$OLD_PACKAGES"
+
+              awk -F= '
+                  $1 ~ /^CONFIG_PACKAGE_/ && ($2 == "y" || $2 == "m") {
+                      sub(/^CONFIG_PACKAGE_/, "", $1)
+                      print $1
+                  }
+              ' "$CURRENT_CONFIG" | sort -u > "$NEW_PACKAGES"
+
+              # --------------------------------------------------------
+              # Added / removed packages
+              # --------------------------------------------------------
+              comm -13 \
+                  "$OLD_PACKAGES" \
+                  "$NEW_PACKAGES" \
+                  > "$ADDED_PACKAGES" || true
+
+              comm -23 \
+                  "$OLD_PACKAGES" \
+                  "$NEW_PACKAGES" \
+                  > "$REMOVED_PACKAGES" || true
+
+              # --------------------------------------------------------
+              # Other non-package CONFIG changes
+              # --------------------------------------------------------
+              diff -u \
+                  "$OLD_CONFIG" \
+                  "$CURRENT_CONFIG" \
+                  | grep -E '^[+-](# )?CONFIG_' \
+                  | grep -Ev '^[+-](# )?CONFIG_PACKAGE_' \
+                  > "$OTHER_CHANGES" || true
+
+              # --------------------------------------------------------
+              # Complete raw diff
+              # --------------------------------------------------------
+              diff -u \
+                  --label "previous/$CONFIG" \
+                  --label "current/$CONFIG" \
+                  "$OLD_CONFIG" \
+                  "$CURRENT_CONFIG" \
+                  > "$FULL_DIFF" || true
+
+              # ========================================================
+              # Release Notes: Added packages
+              # ========================================================
+              {
+                  echo "#### ➕ Added Packages"
+                  echo
+              } >> "$GITHUB_WORKSPACE/release.txt"
+
+              if [ -s "$ADDED_PACKAGES" ]; then
+                  while IFS= read -r PACKAGE; do
+                      [ -n "$PACKAGE" ] && \
+                          printf -- '- `%s`\n' "$PACKAGE"
+                  done < "$ADDED_PACKAGES" \
+                      >> "$GITHUB_WORKSPACE/release.txt"
+              else
+                  echo "_None._" >> "$GITHUB_WORKSPACE/release.txt"
+              fi
+
+              echo >> "$GITHUB_WORKSPACE/release.txt"
+
+              # ========================================================
+              # Release Notes: Removed packages
+              # ========================================================
+              {
+                  echo "#### ➖ Removed Packages"
+                  echo
+              } >> "$GITHUB_WORKSPACE/release.txt"
+
+              if [ -s "$REMOVED_PACKAGES" ]; then
+                  while IFS= read -r PACKAGE; do
+                      [ -n "$PACKAGE" ] && \
+                          printf -- '- `%s`\n' "$PACKAGE"
+                  done < "$REMOVED_PACKAGES" \
+                      >> "$GITHUB_WORKSPACE/release.txt"
+              else
+                  echo "_None._" >> "$GITHUB_WORKSPACE/release.txt"
+              fi
+
+              echo >> "$GITHUB_WORKSPACE/release.txt"
+
+              # ========================================================
+              # Release Notes: Other config changes
+              # ========================================================
+              {
+                  echo "#### ⚙️ Other Configuration Changes"
+                  echo
+              } >> "$GITHUB_WORKSPACE/release.txt"
+
+              if [ -s "$OTHER_CHANGES" ]; then
+                  echo '```diff' >> "$GITHUB_WORKSPACE/release.txt"
+                  cat "$OTHER_CHANGES" >> "$GITHUB_WORKSPACE/release.txt"
+                  echo '```' >> "$GITHUB_WORKSPACE/release.txt"
+              else
+                  echo "_None._" >> "$GITHUB_WORKSPACE/release.txt"
+              fi
+
+              echo >> "$GITHUB_WORKSPACE/release.txt"
+
+              # ========================================================
+              # Release Notes: Complete raw diff
+              # ========================================================
+              {
+                  echo "<details>"
+                  echo "<summary>📋 View complete config diff</summary>"
+                  echo
+                  echo '```diff'
+                  cat "$FULL_DIFF"
+                  echo '```'
+                  echo
+                  echo "</details>"
+                  echo
+              } >> "$GITHUB_WORKSPACE/release.txt"
+
+          done
+
+          # ============================================================
+          # 8. Footer
+          # ============================================================
+          {
+              echo "---"
+              echo
+              echo "## 🧾 Config Snapshot"
+              echo
+              echo "\`release-configs.tar.gz\` contains the config snapshot saved with this Release."
+              echo
+              echo "Future Releases use this snapshot for exact configuration comparisons."
+              echo
+              echo "---"
+              echo
+              echo "## 📥 Download"
+              echo
+              echo "Download the firmware files from the assets below."
+              echo
+              echo "---"
+              echo
+              echo "Built with ❤️ using [GitHub Actions](https://github.com/features/actions)"
+          } >> "$GITHUB_WORKSPACE/release.txt"
+
+          echo
+          echo "============================================================"
+          echo " Generated Release Notes"
+          echo "============================================================"
+          cat "$GITHUB_WORKSPACE/release.txt"
+          echo "============================================================"
+
+          echo "status=success" >> "$GITHUB_OUTPUT"
 
       - name: 📤 Upload to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         if: steps.tag.outputs.status == 'success'
         with:
           tag_name: ${{ steps.tag.outputs.release_tag }}
-          body_path: release.txt
+          body_path: ${{ github.workspace }}/release.txt
           prerelease: ${{ env.PRERELEASE == 'true' }}
           files: ${{ github.workspace }}/firmware_collection/*
 
