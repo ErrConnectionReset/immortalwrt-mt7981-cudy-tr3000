@@ -83,7 +83,7 @@ echo 1 > /sys/class/gpio/modem_power/value
 连接后执行：
 
 ```sh
-cd /workdir/openwrt
+cd openwrt
 make menuconfig
 ```
 
