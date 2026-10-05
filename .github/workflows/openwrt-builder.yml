@@ -299,9 +299,45 @@ jobs:
           done
 
           echo "📥 Collecting artifacts"
-          find bin/targets/ -name "*sysupgrade.bin" -exec cp {} $GITHUB_WORKSPACE/firmware_collection/ \;
+          find bin/targets/ -name "*sysupgrade.bin" -exec cp {} "$GITHUB_WORKSPACE/firmware_collection/" \;
 
-          echo "status=success" >> $GITHUB_OUTPUT
+          # ============================================================
+          # Add build timestamp (YYYYMMDDHHMM) to firmware filenames
+          #
+          # Example:
+          # immortalwrt-mediatek-filogic-20261004-cudy_tr3000-...
+          #
+          # becomes:
+          # immortalwrt-mediatek-filogic-202610051508-cudy_tr3000-...
+          # ============================================================
+          FIRMWARE_TIME="$(date +"%Y%m%d%H%M")"
+
+          echo "🕒 Firmware timestamp: $FIRMWARE_TIME"
+
+          shopt -s nullglob
+
+          for FILE in "$GITHUB_WORKSPACE"/firmware_collection/*sysupgrade.bin; do
+              DIR="$(dirname "$FILE")"
+              NAME="$(basename "$FILE")"
+
+              # Replace the original 8-digit YYYYMMDD section
+              # with the actual build timestamp YYYYMMDDHHMM.
+              if [[ "$NAME" =~ -[0-9]{8}- ]]; then
+                  NEW_NAME="$(printf '%s\n' "$NAME" | \
+                      sed -E "s/-[0-9]{8}-/-${FIRMWARE_TIME}-/")"
+
+                  echo "📝 Rename:"
+                  echo "   $NAME"
+                  echo "-> $NEW_NAME"
+
+                  mv "$FILE" "$DIR/$NEW_NAME"
+              else
+                  echo "⚠️ No YYYYMMDD date field found, keeping original filename:"
+                  echo "   $NAME"
+              fi
+          done
+
+          echo "status=success" >> "$GITHUB_OUTPUT"
 
       - name: 🪄 Upload Binaries (Artifacts)
         uses: actions/upload-artifact@v4
@@ -319,9 +355,9 @@ jobs:
         run: |
           # ============================================================
           # 1. Generate Release tag
-          #    Format: ImmortalWrt-YYYYMMDDHHMM
+          #    Format: ImmortalWrt-YYYYMMDD-HHMM
           # ============================================================
-          BUILD_TIME="$(date +"%Y%m%d%H%M")"
+          BUILD_TIME="$(date +"%Y%m%d-%H%M")"
           RELEASE_TAG="ImmortalWrt-${BUILD_TIME}"
 
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
