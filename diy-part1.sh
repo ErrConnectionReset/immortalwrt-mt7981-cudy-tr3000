@@ -242,11 +242,17 @@ rm -rf "$QUICKSTART_ISTORE_TMP"
 # normal system opkg package selection.
 # ============================================================
 
-ISTORE_COMPAT_DISABLE_SCRIPT="$QUICKSTART_DST/luci-app-store/root/etc/uci-defaults/99-disable-istore-compat"
+# 1 = disable system-level istore_compat by default
+# 0 = keep upstream iStore behavior
+DISABLE_ISTORE_COMPAT=1
 
-mkdir -p "$(dirname "$ISTORE_COMPAT_DISABLE_SCRIPT")"
+if [ "$DISABLE_ISTORE_COMPAT" = "1" ]; then
 
-cat > "$ISTORE_COMPAT_DISABLE_SCRIPT" <<'EOF'
+    ISTORE_COMPAT_DISABLE_SCRIPT="$QUICKSTART_DST/luci-app-store/root/etc/uci-defaults/99-disable-istore-compat"
+
+    mkdir -p "$(dirname "$ISTORE_COMPAT_DISABLE_SCRIPT")"
+
+    cat > "$ISTORE_COMPAT_DISABLE_SCRIPT" <<'EOF'
 #!/bin/sh
 
 CONF="/etc/opkg/compatfeeds.conf"
@@ -257,7 +263,6 @@ if [ -f "$CONF" ]; then
         "$CONF"
 fi
 
-# Remove a possible stale system-level package index.
 rm -f \
     /var/opkg-lists/istore_compat \
     /var/opkg-lists/istore_compat.sig
@@ -265,9 +270,15 @@ rm -f \
 exit 0
 EOF
 
-chmod 0755 "$ISTORE_COMPAT_DISABLE_SCRIPT"
+    chmod 0755 "$ISTORE_COMPAT_DISABLE_SCRIPT"
 
-echo "OK: system-level istore_compat feed will be disabled by default"
+    echo "OK: system-level istore_compat feed will be disabled by default"
+
+else
+
+    echo "OK: system-level istore_compat feed keeps upstream default behavior"
+
+fi
 
 # ============================================================
 # Final verification
