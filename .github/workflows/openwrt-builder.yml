@@ -295,11 +295,97 @@ jobs:
 
             echo "✅ $DEV build finished."
             df -hT /workdir
+
+            # ============================================================
+            # 6. Collect packages selected as <M>
+            #
+            # CONFIG_PACKAGE_xxx=m means:
+            #   - build the package
+            #   - do NOT include it in the firmware image
+            #
+            # Collect those generated IPKs into a per-device archive so
+            # they can be installed manually after flashing.
+            # ============================================================
+            echo "📦 Collecting <M> packages for $DEV"
+
+            MODULE_STAGE="$RUNNER_TEMP/module-packages-$DEV"
+            MODULE_LIST="$MODULE_STAGE/module-packages.txt"
+            MISSING_LIST="$MODULE_STAGE/missing-packages.txt"
+
+            rm -rf "$MODULE_STAGE"
+            mkdir -p "$MODULE_STAGE"
+
+            # Extract all packages explicitly/implicitly selected as =m
+            awk -F= '
+                /^CONFIG_PACKAGE_/ && $2 == "m" {
+                    pkg=$1
+                    sub(/^CONFIG_PACKAGE_/, "", pkg)
+                    print pkg
+                }
+            ' .config | sort -u > "$MODULE_LIST"
+
+            : > "$MISSING_LIST"
+
+            MODULE_COUNT="$(wc -l < "$MODULE_LIST" | tr -d ' ')"
+            IPK_COUNT=0
+
+            echo "Found $MODULE_COUNT package(s) configured as <M>."
+
+            while IFS= read -r PKG; do
+                [ -n "$PKG" ] || continue
+
+                FOUND=false
+
+                while IFS= read -r IPK; do
+                    [ -n "$IPK" ] || continue
+
+                    cp -f "$IPK" "$MODULE_STAGE/"
+                    FOUND=true
+                    IPK_COUNT=$((IPK_COUNT + 1))
+                done < <(
+                    find bin/packages bin/targets \
+                        -type f \
+                        -name "${PKG}_*.ipk" \
+                        2>/dev/null \
+                        | sort -u
+                )
+
+                if [ "$FOUND" != "true" ]; then
+                    echo "$PKG" >> "$MISSING_LIST"
+                fi
+            done < "$MODULE_LIST"
+
+            echo "Collected $IPK_COUNT IPK file(s)."
+
+            if [ -s "$MISSING_LIST" ]; then
+                echo "⚠️ The following <M> package symbols had no matching IPK:"
+                cat "$MISSING_LIST"
+            else
+                echo "✅ Every detected <M> package has a matching IPK."
+                rm -f "$MISSING_LIST"
+            fi
+
+            MODULE_ARCHIVE="$GITHUB_WORKSPACE/firmware_collection/module-packages-${DEV}.tar.gz"
+
+            tar -czf "$MODULE_ARCHIVE" \
+                -C "$MODULE_STAGE" \
+                .
+
+            echo "✅ Module package archive created:"
+            echo "   $MODULE_ARCHIVE"
+
             echo "::endgroup::"
           done
 
-          echo "📥 Collecting artifacts"
-          find bin/targets/ -name "*sysupgrade.bin" -exec cp {} $GITHUB_WORKSPACE/firmware_collection/ \;
+          # ============================================================
+          # 7. Collect firmware images
+          # ============================================================
+          echo "📥 Collecting firmware artifacts"
+
+          find bin/targets/ \
+              -type f \
+              -name "*sysupgrade.bin" \
+              -exec cp -f {} "$GITHUB_WORKSPACE/firmware_collection/" \;
 
           echo "status=success" >> $GITHUB_OUTPUT
 
