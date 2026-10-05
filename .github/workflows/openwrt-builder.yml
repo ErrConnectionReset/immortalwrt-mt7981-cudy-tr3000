@@ -305,6 +305,27 @@ jobs:
             #
             # Collect those generated IPKs into a per-device archive so
             # they can be installed manually after flashing.
+            #
+            # Supports both:
+            #   Normal package:
+            #       foo_1.0-r1_arch.ipk
+            #
+            #   ABI-versioned package:
+            #       libustream-mbedtls20201210_xxx.ipk
+            #       libsqlite3-0_xxx.ipk
+            #
+            # OpenWrt stores ABI_VERSION in:
+            #   staging_dir/.../pkginfo/<package>.version
+            #
+            # OpenWrt ABI naming rule:
+            #   package not ending in digit:
+            #       <package><ABI_VERSION>
+            #
+            #   package ending in digit:
+            #       <package>-<ABI_VERSION>
+            #
+            #   kmod-*:
+            #       no ABI suffix is appended by FormatABISuffix
             # ============================================================
             echo "📦 Collecting <M> packages for $DEV"
 
@@ -315,7 +336,9 @@ jobs:
             rm -rf "$MODULE_STAGE"
             mkdir -p "$MODULE_STAGE"
 
+            # ------------------------------------------------------------
             # Extract all packages explicitly/implicitly selected as =m
+            # ------------------------------------------------------------
             awk -F= '
                 /^CONFIG_PACKAGE_/ && $2 == "m" {
                     pkg=$1
@@ -331,28 +354,110 @@ jobs:
 
             echo "Found $MODULE_COUNT package(s) configured as <M>."
 
+            # ------------------------------------------------------------
+            # Resolve every CONFIG_PACKAGE_xxx=m to its real IPK filename.
+            #
+            # Examples:
+            #
+            #   CONFIG_PACKAGE_iperf3=m
+            #       -> iperf3_*.ipk
+            #
+            #   CONFIG_PACKAGE_libustream-mbedtls=m
+            #       ABI_VERSION=20201210
+            #       -> libustream-mbedtls20201210_*.ipk
+            #
+            #   A package whose original name ends in a digit:
+            #       foo3 + ABI_VERSION=0
+            #       -> foo3-0_*.ipk
+            # ------------------------------------------------------------
             while IFS= read -r PKG; do
                 [ -n "$PKG" ] || continue
 
                 FOUND=false
+                ABI_VERSION=""
+                ABI_FILE=""
+                REAL_PKG_NAME="$PKG"
 
+                # --------------------------------------------------------
+                # kmod-* packages do not receive an ABI suffix through
+                # OpenWrt FormatABISuffix(), so only inspect ABI metadata
+                # for normal userspace packages.
+                # --------------------------------------------------------
+                if [[ "$PKG" != kmod-* ]]; then
+                    ABI_FILE="$(
+                        find staging_dir \
+                            -type f \
+                            -path "*/pkginfo/${PKG}.version" \
+                            -print \
+                            -quit \
+                            2>/dev/null || true
+                    )"
+
+                    if [ -n "$ABI_FILE" ] && [ -f "$ABI_FILE" ]; then
+                        ABI_VERSION="$(
+                            tr -d '[:space:]' < "$ABI_FILE"
+                        )"
+                    fi
+                fi
+
+                # --------------------------------------------------------
+                # Reproduce OpenWrt's FormatABISuffix() naming rule.
+                # --------------------------------------------------------
+                if [ -n "$ABI_VERSION" ]; then
+                    if [[ "$PKG" =~ [0-9]$ ]]; then
+                        REAL_PKG_NAME="${PKG}-${ABI_VERSION}"
+                    else
+                        REAL_PKG_NAME="${PKG}${ABI_VERSION}"
+                    fi
+
+                    echo "  ABI package:"
+                    echo "    config symbol : $PKG"
+                    echo "    ABI version   : $ABI_VERSION"
+                    echo "    IPK prefix    : $REAL_PKG_NAME"
+                fi
+
+                # --------------------------------------------------------
+                # Match the exact resolved package name.
+                #
+                # Deliberately DO NOT use:
+                #
+                #   ${PKG}*.ipk
+                #
+                # because that could incorrectly collect another package
+                # merely sharing the same prefix.
+                # --------------------------------------------------------
                 while IFS= read -r IPK; do
                     [ -n "$IPK" ] || continue
 
+                    BASENAME="$(basename "$IPK")"
+
+                    echo "  + $PKG -> $BASENAME"
+
                     cp -f "$IPK" "$MODULE_STAGE/"
+
                     FOUND=true
                     IPK_COUNT=$((IPK_COUNT + 1))
                 done < <(
                     find bin/packages bin/targets \
                         -type f \
-                        -name "${PKG}_*.ipk" \
+                        -name "${REAL_PKG_NAME}_*.ipk" \
                         2>/dev/null \
                         | sort -u
                 )
 
                 if [ "$FOUND" != "true" ]; then
                     echo "$PKG" >> "$MISSING_LIST"
+
+                    echo "  ⚠️ No matching IPK:"
+                    echo "     config symbol : $PKG"
+
+                    if [ -n "$ABI_VERSION" ]; then
+                        echo "     ABI version   : $ABI_VERSION"
+                    fi
+
+                    echo "     expected      : ${REAL_PKG_NAME}_*.ipk"
                 fi
+
             done < "$MODULE_LIST"
 
             echo "Collected $IPK_COUNT IPK file(s)."
