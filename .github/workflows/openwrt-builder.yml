@@ -768,16 +768,13 @@ jobs:
                  [ -f "$PREV_EXTRACTED/$CONFIG" ]
               then
                   cp -f "$PREV_EXTRACTED/$CONFIG" "$OLD_CONFIG"
-                  COMPARE_SOURCE="Previous Release config snapshot"
-
-              # --------------------------------------------------------
-              # Compatibility fallback for old Releases
-              # --------------------------------------------------------
+                  COMPARE_SOURCE="Config snapshot from ${PREV_TAG}"
+              
               elif [ -n "$PREV_TAG" ] && \
                    git show "${PREV_TAG}:${CONFIG}" \
                        > "$OLD_CONFIG" 2>/dev/null
               then
-                  COMPARE_SOURCE="Previous Release tag (legacy fallback)"
+                  COMPARE_SOURCE="Config from Release tag ${PREV_TAG} (legacy fallback)"
               else
                   echo "_No comparable previous config is available._" \
                       >> "$GITHUB_WORKSPACE/release.txt"
