@@ -74,8 +74,11 @@ jobs:
       config_commit_sha: ${{ steps.push_config.outputs.config_commit_sha }}
 
     steps:
-      - name: 🙌 Checkout
+      - name: 🙌 Checkout latest main
         uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: 🛠️ Init Environment
         run: |
@@ -177,20 +180,19 @@ jobs:
 
           git add "$CONFIG_FILE"
 
-          if git diff --cached --quiet; then
-            echo "ℹ️ Config has no changes."
-          else
+          if ! git diff --cached --quiet; then
             echo "📝 Committing config change..."
-
             git commit -m "Update config: ${CONFIG_FILE}"
-
-            echo "🔄 Rebasing onto latest origin/${TARGET_BRANCH}..."
-            git fetch origin "$TARGET_BRANCH"
-            git rebase "origin/${TARGET_BRANCH}"
-
-            echo "📤 Pushing config commit..."
-            git push origin "HEAD:${TARGET_BRANCH}"
+          else
+            echo "ℹ️ Config has no changes."
           fi
+
+          echo "🔄 Synchronizing with latest origin/${TARGET_BRANCH}..."
+          git fetch origin "$TARGET_BRANCH"
+          git rebase "origin/${TARGET_BRANCH}"
+
+          echo "📤 Pushing final revision..."
+          git push origin "HEAD:${TARGET_BRANCH}"
 
           CONFIG_COMMIT_SHA="$(git rev-parse HEAD)"
 
@@ -559,7 +561,7 @@ jobs:
           # 1. Generate Release tag
           #    Format: ImmortalWrt-YYYYMMDD-HHMM
           # ============================================================
-          BUILD_TIME="$(date +"%Y%m%d-%H%M")"
+          BUILD_TIME="$(date +"%Y%m%d-%H%M%S")"
           RELEASE_TAG="ImmortalWrt-${BUILD_TIME}"
 
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
@@ -673,6 +675,8 @@ jobs:
               echo "**📅 Build Date:** $(date +"%Y-%m-%d %H:%M:%S")"
               echo
               echo "**🔨 Compiler:** GCC with ccache"
+              echo
+              echo "**🔗 Builder Commit:** \`$BUILD_REPO_SHA\`"
               echo
 
               if [ -n "$PREV_TAG" ]; then
