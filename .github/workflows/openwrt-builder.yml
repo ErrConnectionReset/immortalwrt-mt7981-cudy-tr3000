@@ -65,8 +65,13 @@ jobs:
     if: github.event.inputs.ssh == 'true' && github.event.inputs.device != 'all'
     runs-on: ubuntu-22.04
 
+    concurrency:
+      group: immortalwrt-menuconfig-main
+      cancel-in-progress: false
+
     outputs:
       should_build: ${{ steps.build_gate.outputs.should_build }}
+      config_commit_sha: ${{ steps.push_config.outputs.config_commit_sha }}
 
     steps:
       - name: 🙌 Checkout
@@ -153,23 +158,48 @@ jobs:
           fi
   
       - name: 📤 Push config to main branch
+        id: push_config
+        shell: bash
         run: |
+          set -euo pipefail
+
           SRC="/workdir/openwrt/.config"
           DST="$GITHUB_WORKSPACE/${CONFIG_FILE}"
+          TARGET_BRANCH="main"
+
           mkdir -p "$(dirname "$DST")"
           cp -f "$SRC" "$DST"
+
           cd "$GITHUB_WORKSPACE"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add "$CONFIG_FILE"
-          
-          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-          
-          git diff --cached --quiet || (
-            git commit -m "Update config: ${CONFIG_FILE}" || true
-            git pull --rebase origin $CURRENT_BRANCH
-            git push origin HEAD:$CURRENT_BRANCH
-          )
+
+          if git diff --cached --quiet; then
+            echo "ℹ️ Config has no changes."
+          else
+            echo "📝 Committing config change..."
+
+            git commit -m "Update config: ${CONFIG_FILE}"
+
+            echo "🔄 Rebasing onto latest origin/${TARGET_BRANCH}..."
+            git fetch origin "$TARGET_BRANCH"
+            git rebase "origin/${TARGET_BRANCH}"
+
+            echo "📤 Pushing config commit..."
+            git push origin "HEAD:${TARGET_BRANCH}"
+          fi
+
+          CONFIG_COMMIT_SHA="$(git rev-parse HEAD)"
+
+          echo "============================================================"
+          echo " Config commit SHA:"
+          echo " $CONFIG_COMMIT_SHA"
+          echo "============================================================"
+
+          echo "config_commit_sha=$CONFIG_COMMIT_SHA" >> "$GITHUB_OUTPUT"
 
       - name: 📦 Pass current config to Build job
         if: steps.build_gate.outputs.should_build == 'true'
@@ -187,8 +217,24 @@ jobs:
     runs-on: ubuntu-22.04
     
     steps:
-      - name: 🙌 Checkout
+      - name: 🙌 Checkout exact build revision
         uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.menuconfig.outputs.config_commit_sha || github.sha }}
+          fetch-depth: 1
+
+      - name: 🔖 Record exact build revision
+        id: build_revision
+        shell: bash
+        run: |
+          BUILD_REPO_SHA="$(git rev-parse HEAD)"
+
+          echo "============================================================"
+          echo " Exact builder repository revision:"
+          echo " $BUILD_REPO_SHA"
+          echo "============================================================"
+
+          echo "sha=$BUILD_REPO_SHA" >> "$GITHUB_OUTPUT"
 
       - name: 📥 Receive current Menuconfig config
         if: needs.menuconfig.result == 'success' && needs.menuconfig.outputs.should_build == 'true'
@@ -506,6 +552,7 @@ jobs:
         if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          BUILD_REPO_SHA: ${{ steps.build_revision.outputs.sha }}
         shell: bash
         run: |
           # ============================================================
@@ -923,6 +970,7 @@ jobs:
         if: steps.tag.outputs.status == 'success'
         with:
           tag_name: ${{ steps.tag.outputs.release_tag }}
+          target_commitish: ${{ steps.build_revision.outputs.sha }}
           body_path: ${{ github.workspace }}/release.txt
           prerelease: ${{ env.PRERELEASE == 'true' }}
           files: ${{ github.workspace }}/firmware_collection/*
