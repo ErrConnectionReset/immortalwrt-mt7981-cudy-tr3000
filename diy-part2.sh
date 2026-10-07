@@ -625,6 +625,7 @@ if [ -x /etc/init.d/mwan3 ] &&
 
         uci set mwan3.wan.enabled='1'
         uci set mwan3.wan.family='ipv4'
+        uci set mwan3.wan.track_method='ping'
         uci set mwan3.wan.reliability='1'
 
         uci -q delete mwan3.wan.track_ip || true
@@ -663,6 +664,16 @@ if [ -x /etc/init.d/mwan3 ] &&
     uci set mwan3.usbwan_m2_w1.metric='2'
     uci set mwan3.usbwan_m2_w1.weight='1'
 
+    # USB member for load balancing.
+    # Same metric as wan_m1_w3 => load balancing.
+    # Weight 3:1 => WAN receives roughly 75% of new flows,
+    # USB WAN roughly 25%.
+
+    uci set mwan3.usbwan_m1_w1='member'
+    uci set mwan3.usbwan_m1_w1.interface='usbwan'
+    uci set mwan3.usbwan_m1_w1.metric='1'
+    uci set mwan3.usbwan_m1_w1.weight='1'
+
     # --------------------------------------------------------
     # IPv4 primary / backup policy
     # --------------------------------------------------------
@@ -675,6 +686,26 @@ if [ -x /etc/init.d/mwan3 ] &&
     uci add_list mwan3.wan_usb.use_member='usbwan_m2_w1'
 
     uci set mwan3.wan_usb.last_resort='default'
+
+    # --------------------------------------------------------
+    # IPv4 load-balancing policy
+    #
+    # Same member metric:
+    #   WAN     metric 1, weight 3
+    #   USB WAN metric 1, weight 1
+    #
+    # Approximate new-flow distribution:
+    #   WAN : USB WAN = 3 : 1
+    # --------------------------------------------------------
+
+    uci set mwan3.wan_usb_bal='policy'
+
+    uci -q delete mwan3.wan_usb_bal.use_member || true
+
+    uci add_list mwan3.wan_usb_bal.use_member='wan_m1_w3'
+    uci add_list mwan3.wan_usb_bal.use_member='usbwan_m1_w1'
+
+    uci set mwan3.wan_usb_bal.last_resort='default'
 
     # IPv4 default routing.
 
@@ -718,6 +749,11 @@ if [ -x /etc/init.d/mwan3 ] &&
         uci set mwan3.usbwan6_m2_w1.metric='2'
         uci set mwan3.usbwan6_m2_w1.weight='1'
 
+        uci set mwan3.usbwan6_m1_w1='member'
+        uci set mwan3.usbwan6_m1_w1.interface='usbwan6'
+        uci set mwan3.usbwan6_m1_w1.metric='1'
+        uci set mwan3.usbwan6_m1_w1.weight='1'
+
         # IPv6 failover policy.
 
         uci set mwan3.wan6_usb='policy'
@@ -751,6 +787,22 @@ if [ -x /etc/init.d/mwan3 ] &&
         uci add_list mwan3.wan6_usb.use_member='usbwan6_m2_w1'
 
         uci set mwan3.wan6_usb.last_resort='default'
+
+        # ----------------------------------------------------
+        # IPv6 load-balancing policy
+        # ----------------------------------------------------
+
+        uci set mwan3.wan6_usb_bal='policy'
+
+        uci -q delete mwan3.wan6_usb_bal.use_member || true
+
+        if uci -q get network.wan6 >/dev/null 2>&1; then
+            uci add_list mwan3.wan6_usb_bal.use_member='wan6_m1_w3'
+        fi
+
+        uci add_list mwan3.wan6_usb_bal.use_member='usbwan6_m1_w1'
+
+        uci set mwan3.wan6_usb_bal.last_resort='default'
 
         # IPv6 default routing.
 
