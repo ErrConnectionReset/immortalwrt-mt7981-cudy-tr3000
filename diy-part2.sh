@@ -390,159 +390,1057 @@ else
     # so package installation/removal controls its lifecycle.
     # --------------------------------------------------------
 
+
     cat > "$MWAN3_MODE_HELPER" <<'EOF_MWAN3_MODE'
 #!/bin/sh
 
 TAG='mwan3-mode'
+INIT='/etc/init.d/mwan3'
+CONFIG='/etc/config/mwan3'
+
 
 log_msg() {
     logger -t "$TAG" "$*" 2>/dev/null || true
-    echo "$TAG: $*"
 }
+
 
 die() {
     log_msg "ERROR: $*"
+    echo "ERROR: $*" >&2
     exit 1
 }
+
+
+uci_get() {
+    uci -q get "$1" 2>/dev/null || true
+}
+
+
+list_sections() {
+    TYPE="$1"
+
+    uci -q show mwan3 2>/dev/null |
+        sed -n "s/^mwan3\.\([^.=]*\)=${TYPE}$/\1/p"
+}
+
+
+# ============================================================
+# Policy classifier
+#
+# Classification is based on actual mwan3 structure, not names.
+#
+# balance:
+#   >= 2 members
+#   all members have the same metric
+#
+# failover:
+#   >= 2 members
+#   multiple metrics
+#   no metric level contains multiple members
+#
+# hybrid:
+#   multiple metrics and at least one metric level has multiple
+#   members
+#
+# unknown:
+#   incomplete / mixed-family / invalid policy
+#
+# Globals returned:
+#   POLICY_CLASS
+#   POLICY_FAMILY
+#   POLICY_SIGNATURE
+# ============================================================
+
+classify_policy() {
+    POLICY="$1"
+
+    POLICY_CLASS='unknown'
+    POLICY_FAMILY=''
+    POLICY_SIGNATURE=''
+
+    [ "$(uci_get "mwan3.${POLICY}")" = "policy" ] ||
+        return 0
+
+    MEMBERS="$(uci_get "mwan3.${POLICY}.use_member")"
+
+    [ -n "$MEMBERS" ] ||
+        return 0
+
+    MEMBER_COUNT=0
+    METRIC_COUNT=0
+    METRICS=''
+    IFACES=''
+    HAS_SHARED_METRIC=0
+
+    for MEMBER in $MEMBERS; do
+
+        [ "$(uci_get "mwan3.${MEMBER}")" = "member" ] ||
+            return 0
+
+        IFACE="$(uci_get "mwan3.${MEMBER}.interface")"
+
+        [ -n "$IFACE" ] ||
+            return 0
+
+        FAMILY="$(uci_get "mwan3.${IFACE}.family")"
+
+        case "$FAMILY" in
+            ipv4|ipv6)
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+
+        if [ -z "$POLICY_FAMILY" ]; then
+            POLICY_FAMILY="$FAMILY"
+        elif [ "$POLICY_FAMILY" != "$FAMILY" ]; then
+            POLICY_FAMILY=''
+            return 0
+        fi
+
+        METRIC="$(uci_get "mwan3.${MEMBER}.metric")"
+        [ -n "$METRIC" ] || METRIC='1'
+
+        case " $METRICS " in
+            *" $METRIC "*)
+                HAS_SHARED_METRIC=1
+                ;;
+            *)
+                METRICS="$METRICS $METRIC"
+                METRIC_COUNT=$((METRIC_COUNT + 1))
+                ;;
+        esac
+
+        IFACES="$IFACES $IFACE"
+        MEMBER_COUNT=$((MEMBER_COUNT + 1))
+    done
+
+    [ "$MEMBER_COUNT" -ge 2 ] ||
+        return 0
+
+    POLICY_SIGNATURE="$(
+        printf '%s\n' $IFACES |
+            sort -u |
+            tr '\n' ',' |
+            sed 's/,$//'
+    )"
+
+    if [ "$METRIC_COUNT" -eq 1 ]; then
+        POLICY_CLASS='balance'
+
+    elif [ "$METRIC_COUNT" -gt 1 ] &&
+         [ "$HAS_SHARED_METRIC" -eq 0 ]; then
+        POLICY_CLASS='failover'
+
+    else
+        POLICY_CLASS='hybrid'
+    fi
+}
+
+
+# ============================================================
+# Detect one unambiguous default rule for one address family.
+#
+# We deliberately do NOT rely on section names such as:
+#   default_rule_v4
+#   default_rule_v6
+#
+# Globals returned:
+#   RULE_NAME
+#   RULE_STATE
+#
+# States:
+#   ready
+#   no-rule
+#   ambiguous-rule
+# ============================================================
+
+detect_default_rule() {
+    WANT_FAMILY="$1"
+
+    RULE_NAME=''
+    RULE_STATE='no-rule'
+    COUNT=0
+
+    for RULE in $(list_sections rule); do
+
+        FAMILY="$(uci_get "mwan3.${RULE}.family")"
+        DEST="$(uci_get "mwan3.${RULE}.dest_ip")"
+
+        case "$WANT_FAMILY" in
+            ipv4)
+                [ "$DEST" = "0.0.0.0/0" ] || continue
+
+                case "$FAMILY" in
+                    ''|ipv4)
+                        ;;
+                    *)
+                        continue
+                        ;;
+                esac
+                ;;
+
+            ipv6)
+                [ "$DEST" = "::/0" ] || continue
+
+                case "$FAMILY" in
+                    ''|ipv6)
+                        ;;
+                    *)
+                        continue
+                        ;;
+                esac
+                ;;
+
+            *)
+                return 0
+                ;;
+        esac
+
+        COUNT=$((COUNT + 1))
+        RULE_NAME="$RULE"
+    done
+
+    if [ "$COUNT" -eq 1 ]; then
+        RULE_STATE='ready'
+
+    elif [ "$COUNT" -gt 1 ]; then
+        RULE_NAME=''
+        RULE_STATE='ambiguous-rule'
+    fi
+}
+
+
+# ============================================================
+# Locate the unique opposite-mode policy sharing the same
+# address family and interface set.
+#
+# Globals returned:
+#   COUNTERPART_NAME
+#   COUNTERPART_COUNT
+# ============================================================
+
+find_counterpart() {
+    WANT_CLASS="$1"
+    WANT_FAMILY="$2"
+    WANT_SIGNATURE="$3"
+    EXCLUDE="$4"
+
+    COUNTERPART_NAME=''
+    COUNTERPART_COUNT=0
+
+    for POLICY in $(list_sections policy); do
+
+        [ "$POLICY" != "$EXCLUDE" ] ||
+            continue
+
+        classify_policy "$POLICY"
+
+        [ "$POLICY_CLASS" = "$WANT_CLASS" ] ||
+            continue
+
+        [ "$POLICY_FAMILY" = "$WANT_FAMILY" ] ||
+            continue
+
+        [ "$POLICY_SIGNATURE" = "$WANT_SIGNATURE" ] ||
+            continue
+
+        COUNTERPART_COUNT=$((COUNTERPART_COUNT + 1))
+        COUNTERPART_NAME="$POLICY"
+    done
+}
+
+
+# ============================================================
+# Discover one failover/balance pair.
+#
+# Preference:
+#
+# 1. If the current default policy itself can be classified,
+#    use it as an anchor and find its structural counterpart.
+#
+# 2. Otherwise scan all policies and require exactly one
+#    structural pair.
+#
+# This lets arbitrary policy names work while refusing to guess
+# when several equally valid pairs exist.
+#
+# Globals returned:
+#   PAIR_FAILOVER
+#   PAIR_BALANCE
+#   PAIR_STATE
+# ============================================================
+
+discover_policy_pair() {
+    WANT_FAMILY="$1"
+    RULE="$2"
+
+    PAIR_FAILOVER=''
+    PAIR_BALANCE=''
+    PAIR_STATE='no-pair'
+
+    CURRENT_POLICY="$(uci_get "mwan3.${RULE}.use_policy")"
+
+    if [ -n "$CURRENT_POLICY" ]; then
+
+        classify_policy "$CURRENT_POLICY"
+
+        CURRENT_CLASS="$POLICY_CLASS"
+        CURRENT_FAMILY="$POLICY_FAMILY"
+        CURRENT_SIGNATURE="$POLICY_SIGNATURE"
+
+        if [ "$CURRENT_FAMILY" = "$WANT_FAMILY" ]; then
+
+            case "$CURRENT_CLASS" in
+                failover)
+                    find_counterpart \
+                        balance \
+                        "$WANT_FAMILY" \
+                        "$CURRENT_SIGNATURE" \
+                        "$CURRENT_POLICY"
+
+                    if [ "$COUNTERPART_COUNT" -eq 1 ]; then
+                        PAIR_FAILOVER="$CURRENT_POLICY"
+                        PAIR_BALANCE="$COUNTERPART_NAME"
+                        PAIR_STATE='ready'
+                        return 0
+                    elif [ "$COUNTERPART_COUNT" -gt 1 ]; then
+                        PAIR_STATE='ambiguous-pair'
+                        return 0
+                    fi
+                    ;;
+
+                balance)
+                    find_counterpart \
+                        failover \
+                        "$WANT_FAMILY" \
+                        "$CURRENT_SIGNATURE" \
+                        "$CURRENT_POLICY"
+
+                    if [ "$COUNTERPART_COUNT" -eq 1 ]; then
+                        PAIR_FAILOVER="$COUNTERPART_NAME"
+                        PAIR_BALANCE="$CURRENT_POLICY"
+                        PAIR_STATE='ready'
+                        return 0
+                    elif [ "$COUNTERPART_COUNT" -gt 1 ]; then
+                        PAIR_STATE='ambiguous-pair'
+                        return 0
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+
+
+    # --------------------------------------------------------
+    # No usable current-policy anchor.
+    # Search globally, but accept only one unambiguous pair.
+    # --------------------------------------------------------
+
+    PAIR_COUNT=0
+    FOUND_FAIL=''
+    FOUND_BAL=''
+
+    for FAIL_POLICY in $(list_sections policy); do
+
+        classify_policy "$FAIL_POLICY"
+
+        [ "$POLICY_CLASS" = "failover" ] ||
+            continue
+
+        [ "$POLICY_FAMILY" = "$WANT_FAMILY" ] ||
+            continue
+
+        FAIL_SIGNATURE="$POLICY_SIGNATURE"
+
+        for BAL_POLICY in $(list_sections policy); do
+
+            [ "$BAL_POLICY" != "$FAIL_POLICY" ] ||
+                continue
+
+            classify_policy "$BAL_POLICY"
+
+            [ "$POLICY_CLASS" = "balance" ] ||
+                continue
+
+            [ "$POLICY_FAMILY" = "$WANT_FAMILY" ] ||
+                continue
+
+            [ "$POLICY_SIGNATURE" = "$FAIL_SIGNATURE" ] ||
+                continue
+
+            PAIR_COUNT=$((PAIR_COUNT + 1))
+            FOUND_FAIL="$FAIL_POLICY"
+            FOUND_BAL="$BAL_POLICY"
+        done
+    done
+
+    if [ "$PAIR_COUNT" -eq 1 ]; then
+        PAIR_FAILOVER="$FOUND_FAIL"
+        PAIR_BALANCE="$FOUND_BAL"
+        PAIR_STATE='ready'
+
+    elif [ "$PAIR_COUNT" -gt 1 ]; then
+        PAIR_STATE='ambiguous-pair'
+    fi
+}
+
+
+# ============================================================
+# Count sticky rules which are currently coupled to the default
+# rule's selected mode.
+#
+# This generalizes the old hard-coded "https" behavior:
+#
+#   - rule must be sticky
+#   - rule must currently use the same mode policy as default
+#   - unrelated custom rules remain untouched
+# ============================================================
+
+count_followers() {
+    WANT_FAMILY="$1"
+    DEFAULT_RULE="$2"
+    FAIL_POLICY="$3"
+    BAL_POLICY="$4"
+
+    FOLLOWER_COUNT=0
+
+    SOURCE_POLICY="$(
+        uci_get "mwan3.${DEFAULT_RULE}.use_policy"
+    )"
+
+    case "$SOURCE_POLICY" in
+        "$FAIL_POLICY"|"$BAL_POLICY")
+            ;;
+        *)
+            echo 0
+            return 0
+            ;;
+    esac
+
+    for RULE in $(list_sections rule); do
+
+        [ "$RULE" != "$DEFAULT_RULE" ] ||
+            continue
+
+        STICKY="$(uci_get "mwan3.${RULE}.sticky")"
+
+        case "$STICKY" in
+            1|yes|true)
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        FAMILY="$(uci_get "mwan3.${RULE}.family")"
+
+        if [ -n "$FAMILY" ] &&
+           [ "$FAMILY" != "$WANT_FAMILY" ]; then
+            continue
+        fi
+
+        RULE_POLICY="$(
+            uci_get "mwan3.${RULE}.use_policy"
+        )"
+
+        [ "$RULE_POLICY" = "$SOURCE_POLICY" ] ||
+            continue
+
+        FOLLOWER_COUNT=$((FOLLOWER_COUNT + 1))
+    done
+
+    echo "$FOLLOWER_COUNT"
+}
+
+
+# ============================================================
+# Full discovery
+# ============================================================
+
+discover_all() {
+    AVAILABLE='no'
+    SERVICE_STATE='unavailable'
+    READY='no'
+    PARTIAL='no'
+    MODE='unconfigured'
+    REASON=''
+
+    V4_STATE='unavailable'
+    V4_RULE=''
+    V4_FAIL=''
+    V4_BAL=''
+    V4_FOLLOWERS='0'
+
+    V6_STATE='unavailable'
+    V6_RULE=''
+    V6_FAIL=''
+    V6_BAL=''
+    V6_FOLLOWERS='0'
+
+
+    command -v uci >/dev/null 2>&1 || {
+        REASON='uci-missing'
+        return 0
+    }
+
+    [ -f "$CONFIG" ] || {
+        REASON='config-missing'
+        return 0
+    }
+
+    [ -x "$INIT" ] || {
+        REASON='backend-missing'
+        return 0
+    }
+
+    AVAILABLE='yes'
+
+    if "$INIT" running >/dev/null 2>&1; then
+        SERVICE_STATE='running'
+    else
+        SERVICE_STATE='stopped'
+    fi
+
+
+    # IPv4 ---------------------------------------------------
+
+    detect_default_rule ipv4
+
+    V4_RULE="$RULE_NAME"
+    V4_STATE="$RULE_STATE"
+
+    if [ "$RULE_STATE" = "ready" ]; then
+
+        discover_policy_pair ipv4 "$RULE_NAME"
+
+        V4_FAIL="$PAIR_FAILOVER"
+        V4_BAL="$PAIR_BALANCE"
+        V4_STATE="$PAIR_STATE"
+
+        if [ "$V4_STATE" = "ready" ]; then
+            V4_FOLLOWERS="$(
+                count_followers \
+                    ipv4 \
+                    "$V4_RULE" \
+                    "$V4_FAIL" \
+                    "$V4_BAL"
+            )"
+        fi
+    fi
+
+
+    # IPv6 ---------------------------------------------------
+
+    detect_default_rule ipv6
+
+    V6_RULE="$RULE_NAME"
+    V6_STATE="$RULE_STATE"
+
+    if [ "$RULE_STATE" = "ready" ]; then
+
+        discover_policy_pair ipv6 "$RULE_NAME"
+
+        V6_FAIL="$PAIR_FAILOVER"
+        V6_BAL="$PAIR_BALANCE"
+        V6_STATE="$PAIR_STATE"
+
+        if [ "$V6_STATE" = "ready" ]; then
+            V6_FOLLOWERS="$(
+                count_followers \
+                    ipv6 \
+                    "$V6_RULE" \
+                    "$V6_FAIL" \
+                    "$V6_BAL"
+            )"
+        fi
+    fi
+
+
+    V4_READY=0
+    V6_READY=0
+
+    [ "$V4_STATE" = "ready" ] &&
+        V4_READY=1
+
+    [ "$V6_STATE" = "ready" ] &&
+        V6_READY=1
+
+
+    if [ "$V4_READY" -eq 0 ] &&
+       [ "$V6_READY" -eq 0 ]; then
+
+        READY='no'
+        MODE='unconfigured'
+        return 0
+    fi
+
+
+    READY='yes'
+
+    if [ "$V4_READY" -ne "$V6_READY" ]; then
+        PARTIAL='yes'
+    fi
+
+
+    V4_MODE=''
+    V6_MODE=''
+
+    if [ "$V4_READY" -eq 1 ]; then
+
+        CURRENT="$(
+            uci_get "mwan3.${V4_RULE}.use_policy"
+        )"
+
+        if [ "$CURRENT" = "$V4_FAIL" ]; then
+            V4_MODE='failover'
+        elif [ "$CURRENT" = "$V4_BAL" ]; then
+            V4_MODE='balance'
+        else
+            V4_MODE='custom'
+        fi
+    fi
+
+
+    if [ "$V6_READY" -eq 1 ]; then
+
+        CURRENT="$(
+            uci_get "mwan3.${V6_RULE}.use_policy"
+        )"
+
+        if [ "$CURRENT" = "$V6_FAIL" ]; then
+            V6_MODE='failover'
+        elif [ "$CURRENT" = "$V6_BAL" ]; then
+            V6_MODE='balance'
+        else
+            V6_MODE='custom'
+        fi
+    fi
+
+
+    if [ "$V4_READY" -eq 1 ] &&
+       [ "$V6_READY" -eq 1 ]; then
+
+        if [ "$V4_MODE" = "$V6_MODE" ] &&
+           { [ "$V4_MODE" = "failover" ] ||
+             [ "$V4_MODE" = "balance" ]; }; then
+
+            MODE="$V4_MODE"
+
+        else
+            MODE='mixed'
+        fi
+
+    elif [ "$V4_READY" -eq 1 ]; then
+
+        case "$V4_MODE" in
+            failover|balance)
+                MODE="$V4_MODE"
+                ;;
+            *)
+                MODE='mixed'
+                ;;
+        esac
+
+    else
+
+        case "$V6_MODE" in
+            failover|balance)
+                MODE="$V6_MODE"
+                ;;
+            *)
+                MODE='mixed'
+                ;;
+        esac
+    fi
+}
+
+
+# ============================================================
+# Stable machine-readable status protocol.
+#
+# Values here are UCI section identifiers / fixed enum values,
+# so KEY=value is sufficient and avoids requiring jq/jsonfilter.
+# ============================================================
+
+show_status() {
+    discover_all
+
+    echo "Protocol=2"
+    echo "Available=$AVAILABLE"
+    echo "Ready=$READY"
+    echo "Partial=$PARTIAL"
+    echo "Service=$SERVICE_STATE"
+    echo "Mode=$MODE"
+    echo "Reason=$REASON"
+
+    echo "IPv4State=$V4_STATE"
+    echo "IPv4Rule=$V4_RULE"
+    echo "IPv4Failover=$V4_FAIL"
+    echo "IPv4Balance=$V4_BAL"
+    echo "IPv4Followers=$V4_FOLLOWERS"
+
+    echo "IPv6State=$V6_STATE"
+    echo "IPv6Rule=$V6_RULE"
+    echo "IPv6Failover=$V6_FAIL"
+    echo "IPv6Balance=$V6_BAL"
+    echo "IPv6Followers=$V6_FOLLOWERS"
+}
+
+
+# ============================================================
+# Rollback support
+# ============================================================
+
+BACKUP_DATA=''
+
+
+backup_rule() {
+    RULE="$1"
+
+    OLD_POLICY="$(
+        uci_get "mwan3.${RULE}.use_policy"
+    )"
+
+    BACKUP_DATA="${BACKUP_DATA}${RULE}|${OLD_POLICY}
+"
+}
+
+
+restore_backup() {
+    printf '%s' "$BACKUP_DATA" |
+    while IFS='|' read -r RULE OLD_POLICY; do
+
+        [ -n "$RULE" ] ||
+            continue
+
+        if [ -n "$OLD_POLICY" ]; then
+            uci set \
+                "mwan3.${RULE}.use_policy=${OLD_POLICY}" \
+                >/dev/null 2>&1 || true
+        else
+            uci -q delete \
+                "mwan3.${RULE}.use_policy" \
+                >/dev/null 2>&1 || true
+        fi
+
+    done
+
+    uci commit mwan3 >/dev/null 2>&1
+}
+
+
+# ============================================================
+# Apply sticky follower rules which are currently coupled to
+# the source mode.
+# ============================================================
+
+apply_followers() {
+    WANT_FAMILY="$1"
+    DEFAULT_RULE="$2"
+    SOURCE_POLICY="$3"
+    TARGET_POLICY="$4"
+
+    case "$SOURCE_POLICY" in
+        '')
+            return 0
+            ;;
+    esac
+
+    for RULE in $(list_sections rule); do
+
+        [ "$RULE" != "$DEFAULT_RULE" ] ||
+            continue
+
+        STICKY="$(uci_get "mwan3.${RULE}.sticky")"
+
+        case "$STICKY" in
+            1|yes|true)
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        FAMILY="$(uci_get "mwan3.${RULE}.family")"
+
+        if [ -n "$FAMILY" ] &&
+           [ "$FAMILY" != "$WANT_FAMILY" ]; then
+            continue
+        fi
+
+        CURRENT="$(
+            uci_get "mwan3.${RULE}.use_policy"
+        )"
+
+        [ "$CURRENT" = "$SOURCE_POLICY" ] ||
+            continue
+
+        backup_rule "$RULE"
+
+        uci set \
+            "mwan3.${RULE}.use_policy=${TARGET_POLICY}" ||
+            return 1
+    done
+
+    return 0
+}
+
+
+# ============================================================
+# Apply mode
+# ============================================================
+
+apply_mode() {
+    TARGET_MODE="$1"
+
+    discover_all
+
+    [ "$AVAILABLE" = "yes" ] ||
+        die "mwan3 backend is not available"
+
+    [ "$READY" = "yes" ] ||
+        die "no safe failover/load-balancing mapping could be detected"
+
+    case "$TARGET_MODE" in
+        failover|balance)
+            ;;
+        *)
+            die "invalid target mode: $TARGET_MODE"
+            ;;
+    esac
+
+
+    BACKUP_DATA=''
+    CHANGED=0
+
+
+    # IPv4 ---------------------------------------------------
+
+    if [ "$V4_STATE" = "ready" ]; then
+
+        SOURCE="$(
+            uci_get "mwan3.${V4_RULE}.use_policy"
+        )"
+
+        if [ "$TARGET_MODE" = "failover" ]; then
+            TARGET="$V4_FAIL"
+        else
+            TARGET="$V4_BAL"
+        fi
+
+        [ "$(uci_get "mwan3.${TARGET}")" = "policy" ] ||
+            die "IPv4 target policy disappeared during apply"
+
+        backup_rule "$V4_RULE"
+
+        if ! uci set \
+            "mwan3.${V4_RULE}.use_policy=${TARGET}"; then
+
+            uci revert mwan3 >/dev/null 2>&1 || true
+            die "failed to update IPv4 default rule"
+        fi
+
+        if [ "$SOURCE" = "$V4_FAIL" ] ||
+           [ "$SOURCE" = "$V4_BAL" ]; then
+
+            if ! apply_followers \
+                ipv4 \
+                "$V4_RULE" \
+                "$SOURCE" \
+                "$TARGET"; then
+
+                uci revert mwan3 >/dev/null 2>&1 || true
+                die "failed to update IPv4 sticky follower rules"
+            fi
+        fi
+
+        CHANGED=$((CHANGED + 1))
+    fi
+
+
+    # IPv6 ---------------------------------------------------
+
+    if [ "$V6_STATE" = "ready" ]; then
+
+        SOURCE="$(
+            uci_get "mwan3.${V6_RULE}.use_policy"
+        )"
+
+        if [ "$TARGET_MODE" = "failover" ]; then
+            TARGET="$V6_FAIL"
+        else
+            TARGET="$V6_BAL"
+        fi
+
+        [ "$(uci_get "mwan3.${TARGET}")" = "policy" ] ||
+            die "IPv6 target policy disappeared during apply"
+
+        backup_rule "$V6_RULE"
+
+        if ! uci set \
+            "mwan3.${V6_RULE}.use_policy=${TARGET}"; then
+
+            uci revert mwan3 >/dev/null 2>&1 || true
+            die "failed to update IPv6 default rule"
+        fi
+
+        if [ "$SOURCE" = "$V6_FAIL" ] ||
+           [ "$SOURCE" = "$V6_BAL" ]; then
+
+            if ! apply_followers \
+                ipv6 \
+                "$V6_RULE" \
+                "$SOURCE" \
+                "$TARGET"; then
+
+                uci revert mwan3 >/dev/null 2>&1 || true
+                die "failed to update IPv6 sticky follower rules"
+            fi
+        fi
+
+        CHANGED=$((CHANGED + 1))
+    fi
+
+
+    [ "$CHANGED" -gt 0 ] ||
+        die "nothing can be changed safely"
+
+
+    SERVICE_WAS_RUNNING=0
+
+    if "$INIT" running >/dev/null 2>&1; then
+        SERVICE_WAS_RUNNING=1
+    fi
+
+
+    if ! uci commit mwan3; then
+
+        uci revert mwan3 >/dev/null 2>&1 || true
+        die "failed to commit mwan3 configuration"
+    fi
+
+
+    # --------------------------------------------------------
+    # Verify committed default-rule mappings.
+    # --------------------------------------------------------
+
+    VERIFY_OK=1
+
+    if [ "$V4_STATE" = "ready" ]; then
+
+        if [ "$TARGET_MODE" = "failover" ]; then
+            EXPECT="$V4_FAIL"
+        else
+            EXPECT="$V4_BAL"
+        fi
+
+        [ "$(uci_get "mwan3.${V4_RULE}.use_policy")" = "$EXPECT" ] ||
+            VERIFY_OK=0
+    fi
+
+    if [ "$V6_STATE" = "ready" ]; then
+
+        if [ "$TARGET_MODE" = "failover" ]; then
+            EXPECT="$V6_FAIL"
+        else
+            EXPECT="$V6_BAL"
+        fi
+
+        [ "$(uci_get "mwan3.${V6_RULE}.use_policy")" = "$EXPECT" ] ||
+            VERIFY_OK=0
+    fi
+
+
+    if [ "$VERIFY_OK" -ne 1 ]; then
+
+        restore_backup || true
+
+        if [ "$SERVICE_WAS_RUNNING" -eq 1 ]; then
+            "$INIT" restart >/dev/null 2>&1 || true
+        fi
+
+        die "verification failed; previous mwan3 configuration was restored"
+    fi
+
+
+    # --------------------------------------------------------
+    # Preserve runtime state.
+    #
+    # If mwan3 was stopped before applying, do NOT start it.
+    # --------------------------------------------------------
+
+    if [ "$SERVICE_WAS_RUNNING" -eq 1 ]; then
+
+        if ! "$INIT" restart; then
+
+            if restore_backup; then
+                "$INIT" restart >/dev/null 2>&1 || true
+                die "mwan3 restart failed; previous configuration was restored"
+            else
+                die "mwan3 restart failed and automatic rollback also failed"
+            fi
+        fi
+
+        echo "Result=success"
+        echo "ServiceAction=restarted"
+
+    else
+
+        echo "Result=success"
+        echo "ServiceAction=stopped-preserved"
+    fi
+
+
+    log_msg "switched to ${TARGET_MODE}"
+
+    show_status
+}
+
 
 usage() {
     cat <<'EOF_USAGE'
 Usage:
+  mwan3-mode status
   mwan3-mode failover
   mwan3-mode balance
-  mwan3-mode status
 
-Modes:
-  failover
-    IPv4: wan_usb
-    IPv6: wan6_usb
+The helper automatically discovers:
 
-  balance
-    IPv4: wan_usb_bal
-    IPv6: wan6_usb_bal
+  - IPv4 / IPv6 default rules
+  - failover policies
+  - load-balancing policies
+  - structurally matching policy pairs
+  - sticky rules coupled to the current default policy
 
-  status
-    Show current mwan3 policy assignments.
+It refuses to guess when the configuration is ambiguous.
 EOF_USAGE
 }
 
-command -v uci >/dev/null 2>&1 ||
-    die "uci not found"
-
-[ -f /etc/config/mwan3 ] ||
-    die "/etc/config/mwan3 not found"
-
-show_status() {
-    V4="$(uci -q get mwan3.default_rule_v4.use_policy 2>/dev/null || true)"
-    HTTPS="$(uci -q get mwan3.https.use_policy 2>/dev/null || true)"
-    V6="$(uci -q get mwan3.default_rule_v6.use_policy 2>/dev/null || true)"
-
-    echo "===== mwan3 mode status ====="
-    printf '%-20s %s\n' "default_rule_v4:" "${V4:-not configured}"
-    printf '%-20s %s\n' "https:" "${HTTPS:-not configured}"
-    printf '%-20s %s\n' "default_rule_v6:" "${V6:-not configured}"
-
-    echo
-
-    if [ "$V4" = "wan_usb" ] &&
-       { [ -z "$HTTPS" ] || [ "$HTTPS" = "wan_usb" ]; } &&
-       { [ -z "$V6" ] || [ "$V6" = "wan6_usb" ]; }; then
-
-        echo "Mode: failover"
-
-    elif [ "$V4" = "wan_usb_bal" ] &&
-         { [ -z "$HTTPS" ] || [ "$HTTPS" = "wan_usb_bal" ]; } &&
-         { [ -z "$V6" ] || [ "$V6" = "wan6_usb_bal" ]; }; then
-
-        echo "Mode: balance"
-
-    else
-        echo "Mode: mixed/custom"
-    fi
-}
 
 case "$1" in
+    status)
+        show_status
+        ;;
+
     failover)
-        V4_POLICY='wan_usb'
-        V6_POLICY='wan6_usb'
+        apply_mode failover
         ;;
 
     balance)
-        V4_POLICY='wan_usb_bal'
-        V6_POLICY='wan6_usb_bal'
-        ;;
-
-    status)
-        show_status
-        exit 0
+        apply_mode balance
         ;;
 
     -h|--help|help|'')
         usage
-        exit 0
         ;;
 
     *)
-        usage
+        usage >&2
         exit 2
         ;;
 esac
-
-[ "$(uci -q get mwan3.default_rule_v4 2>/dev/null)" = "rule" ] ||
-    die "mwan3.default_rule_v4 does not exist"
-
-[ "$(uci -q get "mwan3.${V4_POLICY}" 2>/dev/null)" = "policy" ] ||
-    die "IPv4 target policy ${V4_POLICY} does not exist"
-
-HAVE_V6=0
-
-if [ "$(uci -q get mwan3.default_rule_v6 2>/dev/null)" = "rule" ]; then
-
-    [ "$(uci -q get "mwan3.${V6_POLICY}" 2>/dev/null)" = "policy" ] ||
-        die "IPv6 target policy ${V6_POLICY} does not exist"
-
-    HAVE_V6=1
-fi
-
-uci set "mwan3.default_rule_v4.use_policy=${V4_POLICY}" ||
-    die "failed to update default_rule_v4"
-
-if [ "$(uci -q get mwan3.https 2>/dev/null)" = "rule" ]; then
-    uci set "mwan3.https.use_policy=${V4_POLICY}" ||
-        die "failed to update https rule"
-fi
-
-if [ "$HAVE_V6" -eq 1 ]; then
-    uci set "mwan3.default_rule_v6.use_policy=${V6_POLICY}" ||
-        die "failed to update default_rule_v6"
-fi
-
-if ! uci commit mwan3; then
-    uci revert mwan3 >/dev/null 2>&1 || true
-    die "failed to commit mwan3 configuration"
-fi
-
-if [ -x /etc/init.d/mwan3 ]; then
-    if ! /etc/init.d/mwan3 restart; then
-        log_msg "WARNING: configuration was saved but mwan3 restart failed"
-        exit 1
-    fi
-else
-    log_msg "WARNING: mwan3 init script not found; configuration saved but not applied"
-    exit 1
-fi
-
-case "$1" in
-    failover)
-        log_msg "switched to failover mode"
-        ;;
-    balance)
-        log_msg "switched to load-balancing mode"
-        ;;
-esac
-
-echo
-show_status
 
 exit 0
 EOF_MWAN3_MODE
@@ -633,19 +1531,75 @@ EOF_MWAN3_MODE_ACL
 'require ui';
 
 
-function parseMode(output) {
-    output = output || '';
+function parseStatus(output) {
+    var data = {};
 
-    if (/Mode:\s*failover/i.test(output))
-        return 'failover';
+    (output || '')
+        .split(/\r?\n/)
+        .forEach(function(line) {
+            var pos =
+                line.indexOf('=');
 
-    if (/Mode:\s*balance/i.test(output))
-        return 'balance';
+            if (pos <= 0)
+                return;
 
-    if (/Mode:\s*mixed\/custom/i.test(output))
-        return 'mixed';
+            data[line.substring(0, pos)] =
+                line.substring(pos + 1);
+        });
 
-    return 'unknown';
+    return {
+        available:
+            data.Available === 'yes',
+
+        ready:
+            data.Ready === 'yes',
+
+        partial:
+            data.Partial === 'yes',
+
+        service:
+            data.Service || 'unavailable',
+
+        mode:
+            data.Mode || 'unconfigured',
+
+        reason:
+            data.Reason || '',
+
+        ipv4: {
+            state:
+                data.IPv4State || 'unavailable',
+
+            rule:
+                data.IPv4Rule || '',
+
+            failover:
+                data.IPv4Failover || '',
+
+            balance:
+                data.IPv4Balance || '',
+
+            followers:
+                data.IPv4Followers || '0'
+        },
+
+        ipv6: {
+            state:
+                data.IPv6State || 'unavailable',
+
+            rule:
+                data.IPv6Rule || '',
+
+            failover:
+                data.IPv6Failover || '',
+
+            balance:
+                data.IPv6Balance || '',
+
+            followers:
+                data.IPv6Followers || '0'
+        }
+    };
 }
 
 
@@ -660,8 +1614,38 @@ function modeLabel(mode) {
     case 'mixed':
         return _('Mixed / Custom');
 
+    case 'unconfigured':
+        return _('Unconfigured');
+
     default:
         return _('Unknown');
+    }
+}
+
+
+function stateLabel(state) {
+    switch (state) {
+    case 'ready':
+        return _('Ready');
+
+    case 'no-rule':
+        return _('No default rule detected');
+
+    case 'ambiguous-rule':
+        return _('Multiple default rules detected');
+
+    case 'no-pair':
+        return _(
+            'No compatible policy pair detected'
+        );
+
+    case 'ambiguous-pair':
+        return _(
+            'Multiple compatible policy pairs detected'
+        );
+
+    default:
+        return _('Unavailable');
     }
 }
 
@@ -671,62 +1655,6 @@ function format1(text, value) {
 }
 
 
-/*
- * Theme-independent alignment.
- *
- * Argon and Aurora use slightly different content offsets.
- * Instead of detecting a specific theme or hard-coding a
- * permanent margin, measure the actual rendered position of
- * the current-mode badge and align the segmented control to it.
- */
-function alignSegmentToContent() {
-    var anchor =
-        document.getElementById(
-            'mwan3-mode-status-anchor'
-        );
-
-    var segment =
-        document.getElementById(
-            'mwan3-mode-segment'
-        );
-
-    if (!anchor || !segment)
-        return;
-
-    segment.style.marginInlineStart = '0px';
-
-    window.requestAnimationFrame(function() {
-        var targetLeft =
-            anchor.getBoundingClientRect().left;
-
-        var currentLeft =
-            segment.getBoundingClientRect().left;
-
-        var delta =
-            Math.round(
-                targetLeft - currentLeft
-            );
-
-        /*
-         * Compensate only for a small layout offset.
-         *
-         * Aurora generally yields approximately zero.
-         * Argon may yield a small positive value.
-         */
-        if (delta > 1 && delta < 64)
-            segment.style.marginInlineStart =
-                delta + 'px';
-    });
-}
-
-
-/*
- * Inline operation feedback.
- *
- * No modal or dismissable notification is used.
- * This avoids visual conflicts with the reload performed
- * after a successful mode switch.
- */
 function setFeedback(kind, message, detail) {
     var box =
         document.getElementById(
@@ -768,7 +1696,8 @@ function setFeedback(kind, message, detail) {
         E(
             'span',
             {
-                'class': labelClass
+                'class':
+                    labelClass
             },
             labelText
         )
@@ -794,16 +1723,11 @@ function setFeedback(kind, message, detail) {
         );
     }
 
-    box.style.display = 'block';
+    box.style.display =
+        'block';
 }
 
 
-/*
- * Preserve one success message across window.location.reload().
- *
- * sessionStorage is tab-local and survives reload, but does
- * not permanently persist.
- */
 function storeFeedback(message) {
     try {
         window.sessionStorage.setItem(
@@ -842,37 +1766,227 @@ function restoreFeedback() {
 }
 
 
+function alignSegmentToContent() {
+    var anchor =
+        document.getElementById(
+            'mwan3-mode-status-anchor'
+        );
+
+    var segment =
+        document.getElementById(
+            'mwan3-mode-segment'
+        );
+
+    if (!anchor || !segment)
+        return;
+
+    segment.style.marginInlineStart =
+        '0px';
+
+    window.requestAnimationFrame(
+        function() {
+
+            var targetLeft =
+                anchor
+                    .getBoundingClientRect()
+                    .left;
+
+            var currentLeft =
+                segment
+                    .getBoundingClientRect()
+                    .left;
+
+            var delta =
+                Math.round(
+                    targetLeft -
+                    currentLeft
+                );
+
+            if (
+                delta > 1 &&
+                delta < 64
+            ) {
+                segment.style.marginInlineStart =
+                    delta + 'px';
+            }
+        }
+    );
+}
+
+
+function mappingDescription(
+    family,
+    info
+) {
+    if (info.state !== 'ready') {
+        return E(
+            'div',
+            {
+                'class':
+                    'cbi-section-descr',
+
+                'style':
+                    'margin-bottom:.75em;'
+            },
+            [
+                E(
+                    'strong',
+                    {},
+                    family + ': '
+                ),
+
+                E(
+                    'span',
+                    {
+                        'class':
+                            'label warning'
+                    },
+                    stateLabel(
+                        info.state
+                    )
+                )
+            ]
+        );
+    }
+
+    return E(
+        'div',
+        {
+            'class':
+                'cbi-section-descr',
+
+            'style':
+                'margin-bottom:.9em;'
+        },
+        [
+            E(
+                'p',
+                {
+                    'style':
+                        'margin:.25em 0;'
+                },
+                [
+                    E(
+                        'strong',
+                        {},
+                        family
+                    ),
+
+                    document.createTextNode(
+                        '  '
+                    ),
+
+                    E(
+                        'span',
+                        {
+                            'class':
+                                'label success'
+                        },
+                        _('Ready')
+                    )
+                ]
+            ),
+
+            E(
+                'p',
+                {
+                    'style':
+                        'margin:.25em 0;'
+                },
+                _(
+                    'Default rule'
+                ) +
+                ': ' +
+                info.rule
+            ),
+
+            E(
+                'p',
+                {
+                    'style':
+                        'margin:.25em 0;'
+                },
+                _(
+                    'Failover policy'
+                ) +
+                ': ' +
+                info.failover
+            ),
+
+            E(
+                'p',
+                {
+                    'style':
+                        'margin:.25em 0;'
+                },
+                _(
+                    'Load-balancing policy'
+                ) +
+                ': ' +
+                info.balance
+            ),
+
+            E(
+                'p',
+                {
+                    'style':
+                        'margin:.25em 0;'
+                },
+                _(
+                    'Sticky follower rules'
+                ) +
+                ': ' +
+                info.followers
+            )
+        ]
+    );
+}
+
+
 return view.extend({
-    actualMode: 'unknown',
-    pendingMode: 'unknown',
+    actualMode:
+        'unconfigured',
+
+    pendingMode:
+        'unconfigured',
+
+    ready:
+        false,
+
+    available:
+        false,
+
+    serviceState:
+        'unavailable',
 
 
     /*
      * No standalone Save button.
      *
-     * Selecting Failover / Load Balancing only stages the
-     * desired value in the browser.
-     *
-     * LuCI provides its native:
+     * LuCI provides:
      *
      *   Save & Apply
-     *   Force / unchecked apply
+     *   Force Apply
      *   Reset
      */
-    handleSave: null,
+    handleSave:
+        null,
 
 
     load: function() {
         return fs.exec(
             '/usr/sbin/mwan3-mode',
             [ 'status' ]
-        ).catch(function(err) {
-            return {
-                code: 1,
-                stdout: '',
-                stderr: String(err)
-            };
-        });
+        ).catch(
+            function(err) {
+                return {
+                    code: 1,
+                    stdout: '',
+                    stderr:
+                        String(err)
+                };
+            }
+        );
     },
 
 
@@ -887,7 +2001,10 @@ return view.extend({
                 'mwan3-mode-balance'
             );
 
-        if (!failover || !balance)
+        if (
+            !failover ||
+            !balance
+        )
             return;
 
         var selected =
@@ -917,7 +2034,6 @@ return view.extend({
                     : 'cbi-button-neutral'
             );
 
-
         balance.className =
             'btn ' +
             (
@@ -925,12 +2041,24 @@ return view.extend({
                     ? 'cbi-button-positive'
                     : 'cbi-button-neutral'
             );
+
+
+        failover.disabled =
+            !this.ready;
+
+        balance.disabled =
+            !this.ready;
     },
 
 
-    handleSelectMode: function(mode, ev) {
+    handleSelectMode:
+        function(mode, ev) {
+
         if (ev)
             ev.preventDefault();
+
+        if (!this.ready)
+            return false;
 
         if (
             mode !== 'failover' &&
@@ -938,40 +2066,29 @@ return view.extend({
         )
             return false;
 
-        /*
-         * Stage only.
-         * Do not change mwan3 yet.
-         */
-        this.pendingMode = mode;
+        this.pendingMode =
+            mode;
 
         this.updateSegment();
 
-        /*
-         * Clear stale feedback when making a new selection.
-         */
         var feedback =
             document.getElementById(
                 'mwan3-mode-feedback'
             );
 
         if (feedback)
-            feedback.style.display = 'none';
+            feedback.style.display =
+                'none';
 
         return false;
     },
 
 
-    /*
-     * Native LuCI Save & Apply handler.
-     *
-     * A normal apply avoids restarting mwan3 if the selected
-     * mode is already active.
-     *
-     * LuCI's force/unchecked apply action re-runs the helper
-     * even if the selected mode is already active.
-     */
-    handleSaveApply: function(ev, applyMode) {
-        var self = this;
+    handleSaveApply:
+        function(ev, applyMode) {
+
+        var self =
+            this;
 
         var target =
             this.pendingMode;
@@ -981,12 +2098,29 @@ return view.extend({
 
 
         if (
+            !this.available ||
+            !this.ready
+        ) {
+            setFeedback(
+                'error',
+                _(
+                    'Mode switching is unavailable until a safe mapping can be detected.'
+                )
+            );
+
+            return Promise.resolve();
+        }
+
+
+        if (
             target !== 'failover' &&
             target !== 'balance'
         ) {
             setFeedback(
                 'error',
-                _('Unknown error')
+                _(
+                    'Select a target mode first.'
+                )
             );
 
             return Promise.resolve();
@@ -995,11 +2129,14 @@ return view.extend({
 
         if (
             !forceApply &&
-            target === this.actualMode
+            target ===
+                this.actualMode
         ) {
             setFeedback(
                 'info',
-                _('No mode change to apply.')
+                _(
+                    'No mode change to apply.'
+                )
             );
 
             return Promise.resolve();
@@ -1013,7 +2150,9 @@ return view.extend({
         setFeedback(
             'working',
             format1(
-                _('Applying %s ...'),
+                _(
+                    'Applying %s ...'
+                ),
                 label
             )
         );
@@ -1022,86 +2161,102 @@ return view.extend({
         return fs.exec(
             '/usr/sbin/mwan3-mode',
             [ target ]
-        ).then(function(res) {
+        ).then(
+            function(res) {
 
-            if (
-                !res ||
-                res.code !== 0
-            ) {
-                var output =
-                    (
-                        res &&
+                if (
+                    !res ||
+                    res.code !== 0
+                ) {
+                    var output =
                         (
-                            res.stderr ||
-                            res.stdout
-                        )
-                    ) ||
-                    _('Unknown error');
+                            res &&
+                            (
+                                res.stderr ||
+                                res.stdout
+                            )
+                        ) ||
+                        _(
+                            'Unknown error'
+                        );
 
+                    setFeedback(
+                        'error',
+                        format1(
+                            _(
+                                'Failed to switch to %s.'
+                            ),
+                            label
+                        ),
+                        output
+                    );
+
+                    return;
+                }
+
+
+                self.actualMode =
+                    target;
+
+                self.pendingMode =
+                    target;
+
+
+                if (
+                    /ServiceAction=stopped-preserved/
+                        .test(
+                            res.stdout || ''
+                        )
+                ) {
+                    storeFeedback(
+                        format1(
+                            _(
+                                'Switched to %s. mwan3 remains stopped.'
+                            ),
+                            label
+                        )
+                    );
+                }
+                else {
+                    storeFeedback(
+                        format1(
+                            target ===
+                                self.actualMode
+                                ? _(
+                                    'Switched to %s.'
+                                  )
+                                : _(
+                                    'Switched to %s.'
+                                  ),
+                            label
+                        )
+                    );
+                }
+
+
+                window.location.reload();
+            }
+        ).catch(
+            function(err) {
 
                 setFeedback(
                     'error',
                     format1(
-                        _('Failed to switch to %s.'),
+                        _(
+                            'Failed to switch to %s.'
+                        ),
                         label
                     ),
-                    output
+                    String(err)
                 );
-
-                return;
             }
-
-
-            var wasSame =
-                target === self.actualMode;
-
-
-            self.actualMode =
-                target;
-
-            self.pendingMode =
-                target;
-
-
-            /*
-             * Do not show a transient success popup here.
-             *
-             * Store the success text first, reload immediately,
-             * then restore the message inline on the new page.
-             */
-            storeFeedback(
-                format1(
-                    wasSame
-                        ? _('Re-applied %s.')
-                        : _('Switched to %s.'),
-                    label
-                )
-            );
-
-
-            window.location.reload();
-
-        }).catch(function(err) {
-
-            setFeedback(
-                'error',
-                format1(
-                    _('Failed to switch to %s.'),
-                    label
-                ),
-                String(err)
-            );
-        });
+        );
     },
 
 
-    /*
-     * Native LuCI Reset button.
-     *
-     * Discard the staged selection and return the segmented
-     * control to the currently applied mode.
-     */
-    handleReset: function(ev) {
+    handleReset:
+        function(ev) {
+
         if (ev)
             ev.preventDefault();
 
@@ -1116,38 +2271,46 @@ return view.extend({
             );
 
         if (feedback)
-            feedback.style.display = 'none';
+            feedback.style.display =
+                'none';
 
         return Promise.resolve();
     },
 
 
     render: function(status) {
-        var output =
-            status && status.stdout
-                ? status.stdout
-                : '';
-
-        var mode =
-            parseMode(output);
+        var parsed =
+            parseStatus(
+                status &&
+                status.stdout
+                    ? status.stdout
+                    : ''
+            );
 
         var self =
             this;
 
 
+        this.available =
+            parsed.available;
+
+        this.ready =
+            parsed.ready;
+
+        this.serviceState =
+            parsed.service;
+
         this.actualMode =
-            mode;
+            parsed.mode;
 
         this.pendingMode =
-            mode;
+            parsed.mode;
 
 
-        /*
-         * Run after LuCI has inserted the view into the DOM.
-         */
         window.setTimeout(
             function() {
                 alignSegmentToContent();
+                self.updateSegment();
                 restoreFeedback();
             },
             0
@@ -1156,8 +2319,8 @@ return view.extend({
 
         function button(which) {
             var active =
-                self.pendingMode === which;
-
+                self.pendingMode ===
+                which;
 
             return E(
                 'button',
@@ -1177,6 +2340,11 @@ return view.extend({
                             ? 'true'
                             : 'false',
 
+                    'disabled':
+                        self.ready
+                            ? null
+                            : 'disabled',
+
                     'class':
                         'btn ' +
                         (
@@ -1186,7 +2354,8 @@ return view.extend({
                         ),
 
                     'style':
-                        which === 'failover'
+                        which ===
+                        'failover'
                             ? (
                                 'margin:0;' +
                                 'min-width:9em;' +
@@ -1213,10 +2382,128 @@ return view.extend({
 
 
         var statusClass =
-            mode === 'failover' ||
-            mode === 'balance'
+            parsed.mode ===
+                'failover' ||
+            parsed.mode ===
+                'balance'
                 ? 'label success'
                 : 'label warning';
+
+
+        var notices = [];
+
+
+        if (!parsed.available) {
+            notices.push(
+                E(
+                    'p',
+                    {},
+                    [
+                        E(
+                            'span',
+                            {
+                                'class':
+                                    'label warning'
+                            },
+                            _('Unavailable')
+                        ),
+
+                        document.createTextNode(
+                            '  ' +
+                            _(
+                                'The mwan3 backend is not available.'
+                            )
+                        )
+                    ]
+                )
+            );
+        }
+        else if (!parsed.ready) {
+            notices.push(
+                E(
+                    'p',
+                    {},
+                    [
+                        E(
+                            'span',
+                            {
+                                'class':
+                                    'label warning'
+                            },
+                            _('Notice')
+                        ),
+
+                        document.createTextNode(
+                            '  ' +
+                            _(
+                                'Mode switching is unavailable until a safe mapping can be detected.'
+                            )
+                        )
+                    ]
+                )
+            );
+        }
+
+
+        if (
+            parsed.ready &&
+            parsed.partial
+        ) {
+            notices.push(
+                E(
+                    'p',
+                    {},
+                    [
+                        E(
+                            'span',
+                            {
+                                'class':
+                                    'label warning'
+                            },
+                            _('Notice')
+                        ),
+
+                        document.createTextNode(
+                            '  ' +
+                            _(
+                                'Only one address family has a safe mapping. The other family will be left unchanged.'
+                            )
+                        )
+                    ]
+                )
+            );
+        }
+
+
+        if (
+            parsed.available &&
+            parsed.service ===
+                'stopped'
+        ) {
+            notices.push(
+                E(
+                    'p',
+                    {},
+                    [
+                        E(
+                            'span',
+                            {
+                                'class':
+                                    'label warning'
+                            },
+                            _('Notice')
+                        ),
+
+                        document.createTextNode(
+                            '  ' +
+                            _(
+                                'mwan3 is stopped. Applying a mode will save the configuration without starting the service.'
+                            )
+                        )
+                    ]
+                )
+            );
+        }
 
 
         return E(
@@ -1242,7 +2529,7 @@ return view.extend({
                             'cbi-map-descr'
                     },
                     _(
-                        'Switch between the predefined failover and load-balancing policies.'
+                        'Automatically detect compatible failover and load-balancing policies and switch the default routing mode safely.'
                     )
                 ),
 
@@ -1257,7 +2544,9 @@ return view.extend({
                         E(
                             'h3',
                             {},
-                            _('Current mode')
+                            _(
+                                'Current mode'
+                            )
                         ),
 
 
@@ -1273,7 +2562,9 @@ return view.extend({
                                     'class':
                                         statusClass
                                 },
-                                modeLabel(mode)
+                                modeLabel(
+                                    parsed.mode
+                                )
                             )
                         ),
 
@@ -1311,14 +2602,6 @@ return view.extend({
                         ),
 
 
-                        /*
-                         * Inline operation result.
-                         *
-                         * Hidden by default.
-                         *
-                         * Success is displayed here after reload.
-                         * Errors remain here without reloading.
-                         */
                         E(
                             'div',
                             {
@@ -1342,55 +2625,52 @@ return view.extend({
                                 'class':
                                     'cbi-section-descr'
                             },
-                            [
-                                E(
-                                    'p',
-                                    {},
-                                    [
-                                        E(
-                                            'strong',
-                                            {},
-                                            _(
-                                                'Failover'
-                                            ) +
-                                            ': '
-                                        ),
-
-                                        _(
-                                            'Wired WAN is preferred. USB WAN takes over when the wired WAN fails.'
-                                        )
-                                    ]
-                                ),
+                            notices
+                        )
+                    ]
+                ),
 
 
-                                E(
-                                    'p',
-                                    {},
-                                    [
-                                        E(
-                                            'strong',
-                                            {},
-                                            _(
-                                                'Load Balancing'
-                                            ) +
-                                            ': '
-                                        ),
-
-                                        _(
-                                            'WAN and USB WAN are used together for connection distribution with the configured 3:1 weight.'
-                                        )
-                                    ]
-                                ),
+                E(
+                    'div',
+                    {
+                        'class':
+                            'cbi-section'
+                    },
+                    [
+                        E(
+                            'h3',
+                            {},
+                            _(
+                                'Detected mapping'
+                            )
+                        ),
 
 
-                                E(
-                                    'p',
-                                    {},
-                                    _(
-                                        'Applying updates the IPv4 default rule, HTTPS sticky rule and the configured IPv6 default rule.'
-                                    )
-                                )
-                            ]
+                        mappingDescription(
+                            'IPv4',
+                            parsed.ipv4
+                        ),
+
+
+                        mappingDescription(
+                            'IPv6',
+                            parsed.ipv6
+                        ),
+
+
+                        E(
+                            'div',
+                            {
+                                'class':
+                                    'cbi-section-descr',
+
+                                'style':
+                                    'margin-top:1em;'
+                            },
+                            _(
+                                'Only automatically detected default rules and coupled sticky rules are changed. Other custom rules are left untouched.'
+                            )
                         )
                     ]
                 )
@@ -1527,6 +2807,86 @@ EOF_MWAN3_PO_HEADER
     add_mwan3_zh_translation \
         "Applying updates the IPv4 default rule, HTTPS sticky rule and the configured IPv6 default rule." \
         "应用时会同时更新 IPv4 默认规则、HTTPS Sticky 规则以及已配置的 IPv6 默认规则。"
+
+    add_mwan3_zh_translation \
+        "Unconfigured" \
+        "未配置"
+
+    add_mwan3_zh_translation \
+        "Ready" \
+        "就绪"
+
+    add_mwan3_zh_translation \
+        "Unavailable" \
+        "不可用"
+
+    add_mwan3_zh_translation \
+        "Detected mapping" \
+        "检测到的模式映射"
+
+    add_mwan3_zh_translation \
+        "Default rule" \
+        "默认规则"
+
+    add_mwan3_zh_translation \
+        "Failover policy" \
+        "故障转移策略"
+
+    add_mwan3_zh_translation \
+        "Load-balancing policy" \
+        "负载均衡策略"
+
+    add_mwan3_zh_translation \
+        "Sticky follower rules" \
+        "联动 Sticky 规则"
+
+    add_mwan3_zh_translation \
+        "No default rule detected" \
+        "未检测到默认规则"
+
+    add_mwan3_zh_translation \
+        "Multiple default rules detected" \
+        "检测到多个默认规则"
+
+    add_mwan3_zh_translation \
+        "No compatible policy pair detected" \
+        "未检测到兼容的策略组合"
+
+    add_mwan3_zh_translation \
+        "Multiple compatible policy pairs detected" \
+        "检测到多个兼容的策略组合"
+
+    add_mwan3_zh_translation \
+        "The mwan3 backend is not available." \
+        "mwan3 后端当前不可用。"
+
+    add_mwan3_zh_translation \
+        "Mode switching is unavailable until a safe mapping can be detected." \
+        "在检测到安全且唯一的模式映射之前，模式切换不可用。"
+
+    add_mwan3_zh_translation \
+        "Only one address family has a safe mapping. The other family will be left unchanged." \
+        "目前只有一种地址族具有安全的模式映射；另一种地址族将保持不变。"
+
+    add_mwan3_zh_translation \
+        "mwan3 is stopped. Applying a mode will save the configuration without starting the service." \
+        "mwan3 当前已停止；应用模式只会保存配置，不会启动服务。"
+
+    add_mwan3_zh_translation \
+        "Automatically detect compatible failover and load-balancing policies and switch the default routing mode safely." \
+        "自动检测兼容的故障转移与负载均衡策略，并安全切换默认路由模式。"
+
+    add_mwan3_zh_translation \
+        "Only automatically detected default rules and coupled sticky rules are changed. Other custom rules are left untouched." \
+        "只修改自动识别出的默认规则及与其联动的 Sticky 规则；其他自定义规则保持不变。"
+
+    add_mwan3_zh_translation \
+        "Select a target mode first." \
+        "请先选择目标模式。"
+
+    add_mwan3_zh_translation \
+        "Switched to %s. mwan3 remains stopped." \
+        "已切换到 %s；mwan3 仍保持停止状态。"
 
 
     echo "OK: LuCI mwan3 mode switch page installed"
