@@ -326,31 +326,71 @@ chmod 0644 "$USBWAN6_NAT66_FILE"
 echo "USB tether IPv6 NAT66 nftables snippet installed:"
 echo "  $USBWAN6_NAT66_FILE"
 
+
+
 # ============================================================
-# mwan3 mode switch helper
+# LuCI mwan3 mode switch integration
 #
-# Runtime commands:
-#   mwan3-mode failover
-#   mwan3-mode balance
-#   mwan3-mode status
+# Adds:
+#   Network -> MultiWAN Manager -> Mode Switch
 #
-# failover:
-#   IPv4 -> wan_usb
-#   IPv6 -> wan6_usb
-#
-# balance:
-#   IPv4 -> wan_usb_bal
-#   IPv6 -> wan6_usb_bal
-#
-# The helper changes only rule -> policy assignments.
-# Members and policies themselves remain untouched.
+# UI:
+#   - Segmented Control
+#   - Native LuCI Save & Apply / Force Apply / Reset
+#   - Staged selection: selecting a mode does not apply it
+#   - Inline operation status instead of modal notifications
+#   - Success message survives the post-apply page reload
+#   - Theme-independent alignment for Argon / Aurora / etc.
+#   - Native LuCI i18n
 # ============================================================
 
-MWAN3_MODE_HELPER="files/usr/sbin/mwan3-mode"
+echo "============================================================"
+echo " Installing LuCI mwan3 mode switch page"
+echo "============================================================"
 
-mkdir -p "$(dirname "$MWAN3_MODE_HELPER")"
+MWAN3_LUCI_DIR=""
 
-cat > "$MWAN3_MODE_HELPER" <<'EOF_MWAN3_MODE'
+for d in \
+    "feeds/luci/applications/luci-app-mwan3" \
+    "package/feeds/luci/luci-app-mwan3" \
+    "package/luci-app-mwan3"
+do
+    if [ -d "$d" ]; then
+        MWAN3_LUCI_DIR="$d"
+        break
+    fi
+done
+
+if [ -z "$MWAN3_LUCI_DIR" ]; then
+
+    echo "WARNING: luci-app-mwan3 source not found;"
+    echo "         LuCI mode switch page skipped"
+
+else
+
+    echo "Found luci-app-mwan3:"
+    echo "  $MWAN3_LUCI_DIR"
+
+    MWAN3_MODE_HELPER="$MWAN3_LUCI_DIR/root/usr/sbin/mwan3-mode"
+    MWAN3_MODE_VIEW="$MWAN3_LUCI_DIR/htdocs/luci-static/resources/view/mwan3/network/mode.js"
+    MWAN3_MODE_MENU="$MWAN3_LUCI_DIR/root/usr/share/luci/menu.d/luci-app-mwan3-mode.json"
+    MWAN3_MODE_ACL="$MWAN3_LUCI_DIR/root/usr/share/rpcd/acl.d/luci-app-mwan3-mode.json"
+    MWAN3_MODE_ZH="$MWAN3_LUCI_DIR/po/zh_Hans/mwan3.po"
+
+    mkdir -p "$(dirname "$MWAN3_MODE_HELPER")"
+    mkdir -p "$(dirname "$MWAN3_MODE_VIEW")"
+    mkdir -p "$(dirname "$MWAN3_MODE_MENU")"
+    mkdir -p "$(dirname "$MWAN3_MODE_ACL")"
+    mkdir -p "$(dirname "$MWAN3_MODE_ZH")"
+
+    # --------------------------------------------------------
+    # Dedicated mwan3 mode switch helper
+    #
+    # Keep this inside luci-app-mwan3 instead of global files/
+    # so package installation/removal controls its lifecycle.
+    # --------------------------------------------------------
+
+    cat > "$MWAN3_MODE_HELPER" <<'EOF_MWAN3_MODE'
 #!/bin/sh
 
 TAG='mwan3-mode'
@@ -448,23 +488,11 @@ case "$1" in
         ;;
 esac
 
-# ------------------------------------------------------------
-# Validate IPv4 rule and target policy.
-# IPv4 is mandatory for this helper.
-# ------------------------------------------------------------
-
 [ "$(uci -q get mwan3.default_rule_v4 2>/dev/null)" = "rule" ] ||
     die "mwan3.default_rule_v4 does not exist"
 
 [ "$(uci -q get "mwan3.${V4_POLICY}" 2>/dev/null)" = "policy" ] ||
     die "IPv4 target policy ${V4_POLICY} does not exist"
-
-# ------------------------------------------------------------
-# IPv6 is optional.
-#
-# If default_rule_v6 exists, its corresponding policy must
-# also exist. If IPv6 was never configured, simply skip it.
-# ------------------------------------------------------------
 
 HAVE_V6=0
 
@@ -476,14 +504,9 @@ if [ "$(uci -q get mwan3.default_rule_v6 2>/dev/null)" = "rule" ]; then
     HAVE_V6=1
 fi
 
-# ------------------------------------------------------------
-# Change all related rules before one single UCI commit.
-# ------------------------------------------------------------
-
 uci set "mwan3.default_rule_v4.use_policy=${V4_POLICY}" ||
     die "failed to update default_rule_v4"
 
-# HTTPS sticky rule is optional.
 if [ "$(uci -q get mwan3.https 2>/dev/null)" = "rule" ]; then
     uci set "mwan3.https.use_policy=${V4_POLICY}" ||
         die "failed to update https rule"
@@ -494,13 +517,11 @@ if [ "$HAVE_V6" -eq 1 ]; then
         die "failed to update default_rule_v6"
 fi
 
-# Commit all rule changes together.
 if ! uci commit mwan3; then
     uci revert mwan3 >/dev/null 2>&1 || true
     die "failed to commit mwan3 configuration"
 fi
 
-# Apply immediately.
 if [ -x /etc/init.d/mwan3 ]; then
     if ! /etc/init.d/mwan3 restart; then
         log_msg "WARNING: configuration was saved but mwan3 restart failed"
@@ -526,67 +547,10 @@ show_status
 exit 0
 EOF_MWAN3_MODE
 
-chmod 0755 "$MWAN3_MODE_HELPER"
+    chmod 0755 "$MWAN3_MODE_HELPER"
 
-echo "mwan3 mode switch helper installed:"
-echo "  /usr/sbin/mwan3-mode"
-echo "  mwan3-mode failover"
-echo "  mwan3-mode balance"
-echo "  mwan3-mode status"
-
-
-# ============================================================
-# LuCI mwan3 mode switch integration
-#
-# Adds:
-#   Network -> MultiWAN Manager -> Mode Switch
-#
-# UI:
-#   - Segmented Control
-#   - Native LuCI Save & Apply / Force Apply / Reset
-#   - Staged selection: selecting a mode does not apply it
-#   - Inline operation status instead of modal notifications
-#   - Success message survives the post-apply page reload
-#   - Theme-independent alignment for Argon / Aurora / etc.
-#   - Native LuCI i18n
-# ============================================================
-
-echo "============================================================"
-echo " Installing LuCI mwan3 mode switch page"
-echo "============================================================"
-
-MWAN3_LUCI_DIR=""
-
-for d in \
-    "feeds/luci/applications/luci-app-mwan3" \
-    "package/feeds/luci/luci-app-mwan3" \
-    "package/luci-app-mwan3"
-do
-    if [ -d "$d" ]; then
-        MWAN3_LUCI_DIR="$d"
-        break
-    fi
-done
-
-if [ -z "$MWAN3_LUCI_DIR" ]; then
-
-    echo "WARNING: luci-app-mwan3 source not found;"
-    echo "         LuCI mode switch page skipped"
-
-else
-
-    echo "Found luci-app-mwan3:"
-    echo "  $MWAN3_LUCI_DIR"
-
-    MWAN3_MODE_VIEW="$MWAN3_LUCI_DIR/htdocs/luci-static/resources/view/mwan3/network/mode.js"
-    MWAN3_MODE_MENU="$MWAN3_LUCI_DIR/root/usr/share/luci/menu.d/luci-app-mwan3-mode.json"
-    MWAN3_MODE_ACL="$MWAN3_LUCI_DIR/root/usr/share/rpcd/acl.d/luci-app-mwan3-mode.json"
-    MWAN3_MODE_ZH="$MWAN3_LUCI_DIR/po/zh_Hans/mwan3.po"
-
-    mkdir -p "$(dirname "$MWAN3_MODE_VIEW")"
-    mkdir -p "$(dirname "$MWAN3_MODE_MENU")"
-    mkdir -p "$(dirname "$MWAN3_MODE_ACL")"
-    mkdir -p "$(dirname "$MWAN3_MODE_ZH")"
+    echo "mwan3 mode switch helper added to luci-app-mwan3 package:"
+    echo "  /usr/sbin/mwan3-mode"
 
     # --------------------------------------------------------
     # LuCI menu
