@@ -299,3 +299,443 @@ else
 fi
 
 echo "OpenClash DNS compatibility check finished"
+
+# ============================================================
+# First-boot USB tether WAN + optional IPv6 + mwan3 failover
+#
+# Wired WAN:
+#   wan      -> eth0
+#   wan6     -> eth0
+#
+# USB tether WAN:
+#   usbwan   -> usb0   (DHCPv4)
+#   usbwan6  -> usb0   (DHCPv6 / SLAAC)
+#
+# Priority:
+#   Wired WAN = 10
+#   USB WAN   = 20
+#
+# Compatibility:
+#   Missing USB network drivers -> skip safely
+#   Missing odhcp6c             -> IPv4 only
+#   Missing mwan3               -> normal routing metrics
+#   USB cable not connected     -> interfaces remain configured
+# ============================================================
+
+echo "============================================================"
+echo " Installing USB tether WAN first-boot configuration"
+echo "============================================================"
+
+USB_TETHER_DEFAULTS="files/etc/uci-defaults/98-usb-tether-failover"
+
+mkdir -p "$(dirname "$USB_TETHER_DEFAULTS")"
+
+cat > "$USB_TETHER_DEFAULTS" <<'EOF_USB_TETHER'
+#!/bin/sh
+
+TAG='usb-tether-firstboot'
+
+log_msg() {
+    logger -t "$TAG" "$*" 2>/dev/null || true
+    echo "$TAG: $*"
+}
+
+# ------------------------------------------------------------
+# 1. Detect installed USB tethering drivers
+#
+# Do not require usb0 to exist during first boot.
+# The phone may not be connected yet.
+# ------------------------------------------------------------
+
+has_usb_driver() {
+    for mod in rndis_host cdc_ncm cdc_ether cdc_eem ipheth; do
+        [ -d "/sys/module/$mod" ] && return 0
+    done
+
+    if command -v opkg >/dev/null 2>&1; then
+        for pkg in \
+            kmod-usb-net-rndis \
+            kmod-usb-net-cdc-ncm \
+            kmod-usb-net-cdc-ether \
+            kmod-usb-net-cdc-eem \
+            kmod-usb-net-ipheth
+        do
+            opkg status "$pkg" 2>/dev/null |
+                grep -q 'Status: install ok installed' &&
+                return 0
+        done
+    fi
+
+    return 1
+}
+
+command -v uci >/dev/null 2>&1 || exit 0
+
+if ! has_usb_driver; then
+    log_msg "USB tether driver not installed; skipping"
+    exit 0
+fi
+
+if ! uci -q get network.wan >/dev/null 2>&1; then
+    log_msg "Network WAN interface missing; skipping"
+    exit 0
+fi
+
+# Protect an existing interface with a different configuration.
+
+if uci -q get network.usbwan >/dev/null 2>&1; then
+    OLD_PROTO="$(uci -q get network.usbwan.proto)"
+    OLD_DEVICE="$(uci -q get network.usbwan.device)"
+
+    if [ "$OLD_PROTO" != "dhcp" ] ||
+       [ "$OLD_DEVICE" != "usb0" ]; then
+        log_msg "Existing usbwan differs; preserving configuration"
+        exit 0
+    fi
+fi
+
+# ------------------------------------------------------------
+# 2. Locate existing WAN firewall zone
+# ------------------------------------------------------------
+
+WAN_ZONE=''
+
+for sec in $(uci -q show firewall |
+    sed -n 's/^firewall\.\(.*\)=zone$/\1/p')
+do
+    if [ "$(uci -q get "firewall.$sec.name")" = "wan" ]; then
+        WAN_ZONE="$sec"
+        break
+    fi
+done
+
+if [ -z "$WAN_ZONE" ]; then
+    log_msg "WAN firewall zone missing; skipping"
+    exit 0
+fi
+
+has_list_item() {
+    case " $(uci -q get "$1" 2>/dev/null) " in
+        *" $2 "*) return 0 ;;
+    esac
+
+    return 1
+}
+
+# ------------------------------------------------------------
+# 3. Configure IPv4 USB WAN
+# ------------------------------------------------------------
+
+uci set network.usbwan='interface'
+uci set network.usbwan.proto='dhcp'
+uci set network.usbwan.device='usb0'
+
+# Main routing table priorities.
+
+uci set network.wan.metric='10'
+uci set network.usbwan.metric='20'
+
+log_msg "USB IPv4 WAN configured"
+
+# ------------------------------------------------------------
+# 4. Configure optional IPv6 USB WAN
+#
+# The DHCPv6 client also supports IPv6 RA/SLAAC.
+# IPv6 prefix delegation depends on the upstream phone.
+# ------------------------------------------------------------
+
+V6_READY=0
+
+if command -v odhcp6c >/dev/null 2>&1 &&
+   [ -f /lib/netifd/proto/dhcpv6.sh ]; then
+
+    V6_READY=1
+
+    if uci -q get network.usbwan6 >/dev/null 2>&1; then
+
+        V6_PROTO="$(uci -q get network.usbwan6.proto)"
+        V6_DEVICE="$(uci -q get network.usbwan6.device)"
+
+        case "$V6_PROTO/$V6_DEVICE" in
+            dhcpv6/@usbwan|dhcpv6/usb0)
+                ;;
+            *)
+                log_msg "Existing usbwan6 differs; preserving it"
+                V6_READY=0
+                ;;
+        esac
+    fi
+
+    if [ "$V6_READY" -eq 1 ]; then
+
+        uci set network.usbwan6='interface'
+        uci set network.usbwan6.proto='dhcpv6'
+
+        # Reference usbwan's physical device: usb0.
+        uci set network.usbwan6.device='@usbwan'
+
+        uci set network.usbwan6.reqaddress='try'
+        uci set network.usbwan6.reqprefix='auto'
+        uci set network.usbwan6.metric='20'
+
+        if uci -q get network.wan6 >/dev/null 2>&1; then
+            uci set network.wan6.metric='10'
+        fi
+
+        log_msg "USB IPv6 WAN configured"
+    fi
+
+else
+    log_msg "DHCPv6 client missing; IPv6 configuration skipped"
+fi
+
+# ------------------------------------------------------------
+# 5. Firewall
+#
+# Use the existing WAN zone.
+# Keep IPv4 NAT and MTU fixing enabled.
+# Do not enable NAT66 automatically.
+# ------------------------------------------------------------
+
+if ! has_list_item "firewall.$WAN_ZONE.network" usbwan; then
+    uci add_list "firewall.$WAN_ZONE.network=usbwan"
+fi
+
+if [ "$V6_READY" -eq 1 ]; then
+    if ! has_list_item "firewall.$WAN_ZONE.network" usbwan6; then
+        uci add_list "firewall.$WAN_ZONE.network=usbwan6"
+    fi
+fi
+
+uci set "firewall.$WAN_ZONE.masq=1"
+uci set "firewall.$WAN_ZONE.mtu_fix=1"
+
+# Ensure LAN -> WAN forwarding exists without duplicating it.
+
+HAS_FORWARD=0
+
+for sec in $(uci -q show firewall |
+    sed -n 's/^firewall\.\(.*\)=forwarding$/\1/p')
+do
+    if [ "$(uci -q get "firewall.$sec.src")" = "lan" ] &&
+       [ "$(uci -q get "firewall.$sec.dest")" = "wan" ]; then
+
+        HAS_FORWARD=1
+        break
+    fi
+done
+
+if [ "$HAS_FORWARD" -eq 0 ]; then
+
+    FWD_SEC="$(uci add firewall forwarding)"
+
+    uci set "firewall.$FWD_SEC.src=lan"
+    uci set "firewall.$FWD_SEC.dest=wan"
+
+fi
+
+# ------------------------------------------------------------
+# 6. Optional mwan3 configuration
+#
+# IPv4:
+#   wan     metric 1
+#   usbwan  metric 2
+#
+# IPv6:
+#   wan6     metric 1
+#   usbwan6  metric 2
+#
+# Keep existing unrelated mwan3 policies untouched.
+# ------------------------------------------------------------
+
+if [ -x /etc/init.d/mwan3 ] &&
+   [ -f /etc/config/mwan3 ]; then
+
+    # --------------------------------------------------------
+    # IPv4 wired WAN tracking
+    # --------------------------------------------------------
+
+    if uci -q get mwan3.wan >/dev/null 2>&1; then
+
+        uci set mwan3.wan.enabled='1'
+        uci set mwan3.wan.family='ipv4'
+        uci set mwan3.wan.reliability='1'
+
+        uci -q delete mwan3.wan.track_ip || true
+
+        uci add_list mwan3.wan.track_ip='223.5.5.5'
+        uci add_list mwan3.wan.track_ip='119.29.29.29'
+
+    fi
+
+    # --------------------------------------------------------
+    # IPv4 USB WAN tracking
+    # --------------------------------------------------------
+
+    uci set mwan3.usbwan='interface'
+    uci set mwan3.usbwan.enabled='1'
+    uci set mwan3.usbwan.family='ipv4'
+    uci set mwan3.usbwan.track_method='ping'
+    uci set mwan3.usbwan.reliability='1'
+
+    uci -q delete mwan3.usbwan.track_ip || true
+
+    uci add_list mwan3.usbwan.track_ip='223.5.5.5'
+    uci add_list mwan3.usbwan.track_ip='119.29.29.29'
+
+    # --------------------------------------------------------
+    # IPv4 members
+    # --------------------------------------------------------
+
+    uci set mwan3.wan_m1_w3='member'
+    uci set mwan3.wan_m1_w3.interface='wan'
+    uci set mwan3.wan_m1_w3.metric='1'
+    uci set mwan3.wan_m1_w3.weight='3'
+
+    uci set mwan3.usbwan_m2_w1='member'
+    uci set mwan3.usbwan_m2_w1.interface='usbwan'
+    uci set mwan3.usbwan_m2_w1.metric='2'
+    uci set mwan3.usbwan_m2_w1.weight='1'
+
+    # --------------------------------------------------------
+    # IPv4 primary / backup policy
+    # --------------------------------------------------------
+
+    uci set mwan3.wan_usb='policy'
+
+    uci -q delete mwan3.wan_usb.use_member || true
+
+    uci add_list mwan3.wan_usb.use_member='wan_m1_w3'
+    uci add_list mwan3.wan_usb.use_member='usbwan_m2_w1'
+
+    uci set mwan3.wan_usb.last_resort='default'
+
+    # IPv4 default routing.
+
+    uci set mwan3.default_rule_v4='rule'
+    uci set mwan3.default_rule_v4.dest_ip='0.0.0.0/0'
+    uci set mwan3.default_rule_v4.family='ipv4'
+    uci set mwan3.default_rule_v4.use_policy='wan_usb'
+
+    # Preserve HTTPS sticky settings where present.
+
+    if uci -q get mwan3.https >/dev/null 2>&1; then
+
+        uci set mwan3.https.use_policy='wan_usb'
+        uci set mwan3.https.family='ipv4'
+
+    fi
+
+    # --------------------------------------------------------
+    # Optional IPv6 mwan3 failover
+    # --------------------------------------------------------
+
+    if [ "$V6_READY" -eq 1 ]; then
+
+        # USB IPv6 interface monitoring.
+
+        uci set mwan3.usbwan6='interface'
+        uci set mwan3.usbwan6.enabled='1'
+        uci set mwan3.usbwan6.family='ipv6'
+        uci set mwan3.usbwan6.track_method='ping'
+        uci set mwan3.usbwan6.reliability='1'
+
+        uci -q delete mwan3.usbwan6.track_ip || true
+
+        uci add_list mwan3.usbwan6.track_ip='2606:4700:4700::1111'
+        uci add_list mwan3.usbwan6.track_ip='2001:4860:4860::8888'
+
+        # USB IPv6 member.
+
+        uci set mwan3.usbwan6_m2_w1='member'
+        uci set mwan3.usbwan6_m2_w1.interface='usbwan6'
+        uci set mwan3.usbwan6_m2_w1.metric='2'
+        uci set mwan3.usbwan6_m2_w1.weight='1'
+
+        # IPv6 failover policy.
+
+        uci set mwan3.wan6_usb='policy'
+
+        uci -q delete mwan3.wan6_usb.use_member || true
+
+        # Wired IPv6 is preferred if configured.
+
+        if uci -q get network.wan6 >/dev/null 2>&1; then
+
+            uci set mwan3.wan6='interface'
+            uci set mwan3.wan6.enabled='1'
+            uci set mwan3.wan6.family='ipv6'
+            uci set mwan3.wan6.reliability='1'
+
+            uci set mwan3.wan6_m1_w3='member'
+            uci set mwan3.wan6_m1_w3.interface='wan6'
+            uci set mwan3.wan6_m1_w3.metric='1'
+            uci set mwan3.wan6_m1_w3.weight='3'
+
+            uci add_list mwan3.wan6_usb.use_member='wan6_m1_w3'
+
+        fi
+
+        uci add_list mwan3.wan6_usb.use_member='usbwan6_m2_w1'
+
+        uci set mwan3.wan6_usb.last_resort='default'
+
+        # IPv6 default routing.
+
+        uci set mwan3.default_rule_v6='rule'
+        uci set mwan3.default_rule_v6.dest_ip='::/0'
+        uci set mwan3.default_rule_v6.family='ipv6'
+        uci set mwan3.default_rule_v6.use_policy='wan6_usb'
+
+    fi
+
+    uci commit mwan3 || exit 1
+
+    # Enable mwan3 at boot.
+
+    /etc/init.d/mwan3 enable >/dev/null 2>&1 || true
+
+    log_msg "mwan3 WAN failover configured"
+
+else
+
+    log_msg "mwan3 not installed; using normal route metrics"
+
+fi
+
+# ------------------------------------------------------------
+# 7. Save configuration
+# ------------------------------------------------------------
+
+uci commit network || exit 1
+uci commit firewall || exit 1
+
+# ------------------------------------------------------------
+# 8. Apply configuration without requiring a reboot
+#
+# If services are not yet ready, normal system startup
+# will subsequently load the committed configuration.
+# ------------------------------------------------------------
+
+if [ -x /etc/init.d/network ]; then
+    /etc/init.d/network reload >/dev/null 2>&1 || true
+fi
+
+if [ -x /etc/init.d/firewall ]; then
+    /etc/init.d/firewall reload >/dev/null 2>&1 || true
+fi
+
+if [ -x /etc/init.d/mwan3 ]; then
+    /etc/init.d/mwan3 restart >/dev/null 2>&1 || true
+fi
+
+log_msg "USB tether WAN initialization completed"
+
+exit 0
+
+EOF_USB_TETHER
+
+chmod 0644 "$USB_TETHER_DEFAULTS"
+
+echo "USB tether WAN first-boot script installed:"
+echo "  $USB_TETHER_DEFAULTS"
