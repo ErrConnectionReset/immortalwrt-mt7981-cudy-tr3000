@@ -1569,6 +1569,1349 @@ EOF_MWAN3_PO_HEADER
     echo "  Network -> MultiWAN Manager -> Mode Switch"
     echo "  Chinese UI -> 模式切换"
 
+    # ========================================================
+    # LuCI mwan3 service control integration
+    #
+    # Adds:
+    #   Network -> MultiWAN Manager -> Service Control
+    #
+    # URL:
+    #   /cgi-bin/luci/admin/network/mwan3/service
+    #
+    # Features:
+    #   - Boot enable / disable as a staged selection
+    #   - Native LuCI Save & Apply / Force Apply / Reset
+    #   - Immediate Start / Stop / Restart controls
+    #   - Boot state and runtime state are independent
+    #   - Graceful handling if the mwan3 backend disappears
+    #   - Theme-independent alignment for Argon / Aurora / etc.
+    #   - Package-owned helper/menu/ACL/view:
+    #       removing luci-app-mwan3 removes this enhancement too
+    #   - Native LuCI i18n
+    # ========================================================
+
+    echo "============================================================"
+    echo " Installing LuCI mwan3 service control page"
+    echo "============================================================"
+
+    MWAN3_SERVICE_HELPER="$MWAN3_LUCI_DIR/root/usr/sbin/mwan3-service-control"
+    MWAN3_SERVICE_VIEW="$MWAN3_LUCI_DIR/htdocs/luci-static/resources/view/mwan3/network/service-control.js"
+    MWAN3_SERVICE_MENU="$MWAN3_LUCI_DIR/root/usr/share/luci/menu.d/luci-app-mwan3-service.json"
+    MWAN3_SERVICE_ACL="$MWAN3_LUCI_DIR/root/usr/share/rpcd/acl.d/luci-app-mwan3-service.json"
+
+    mkdir -p "$(dirname "$MWAN3_SERVICE_HELPER")"
+    mkdir -p "$(dirname "$MWAN3_SERVICE_VIEW")"
+    mkdir -p "$(dirname "$MWAN3_SERVICE_MENU")"
+    mkdir -p "$(dirname "$MWAN3_SERVICE_ACL")"
+
+    # --------------------------------------------------------
+    # Dedicated service helper
+    #
+    # Keep this inside luci-app-mwan3 instead of global files/
+    # so package installation/removal controls its lifecycle.
+    # --------------------------------------------------------
+
+    cat > "$MWAN3_SERVICE_HELPER" <<'EOF_MWAN3_SERVICE_HELPER'
+#!/bin/sh
+
+INIT='/etc/init.d/mwan3'
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+available() {
+    [ -x "$INIT" ]
+}
+
+show_status() {
+    if ! available; then
+        echo 'Available: no'
+        echo 'Boot: unavailable'
+        echo 'Runtime: unavailable'
+        return 0
+    fi
+
+    echo 'Available: yes'
+
+    if "$INIT" enabled >/dev/null 2>&1; then
+        echo 'Boot: enabled'
+    else
+        echo 'Boot: disabled'
+    fi
+
+    if "$INIT" running >/dev/null 2>&1; then
+        echo 'Runtime: running'
+    else
+        echo 'Runtime: stopped'
+    fi
+}
+
+require_available() {
+    available ||
+        die "mwan3 init script is not available"
+}
+
+case "$1" in
+    status)
+        show_status
+        ;;
+
+    enable)
+        require_available
+        "$INIT" enable ||
+            die "failed to enable mwan3 at boot"
+        show_status
+        ;;
+
+    disable)
+        require_available
+        "$INIT" disable ||
+            die "failed to disable mwan3 at boot"
+        show_status
+        ;;
+
+    start)
+        require_available
+        "$INIT" start ||
+            die "failed to start mwan3"
+        show_status
+        ;;
+
+    stop)
+        require_available
+        "$INIT" stop ||
+            die "failed to stop mwan3"
+        show_status
+        ;;
+
+    restart)
+        require_available
+        "$INIT" restart ||
+            die "failed to restart mwan3"
+        show_status
+        ;;
+
+    *)
+        echo "Usage: $0 {status|enable|disable|start|stop|restart}" >&2
+        exit 2
+        ;;
+esac
+
+exit 0
+EOF_MWAN3_SERVICE_HELPER
+
+    chmod 0755 "$MWAN3_SERVICE_HELPER"
+
+    # --------------------------------------------------------
+    # LuCI menu
+    #
+    # The visible URL remains:
+    #
+    #   /cgi-bin/luci/admin/network/mwan3/service
+    #
+    # while the actual JS filename deliberately uses
+    # "service-control" to reduce the chance of colliding with
+    # a future upstream service.js.
+    # --------------------------------------------------------
+
+    cat > "$MWAN3_SERVICE_MENU" <<'EOF_MWAN3_SERVICE_MENU'
+{
+    "admin/network/mwan3/service": {
+        "title": "Service Control",
+        "order": 120,
+        "action": {
+            "type": "view",
+            "path": "mwan3/network/service-control"
+        },
+        "depends": {
+            "acl": [
+                "luci-app-mwan3-service"
+            ]
+        }
+    }
+}
+EOF_MWAN3_SERVICE_MENU
+
+    # --------------------------------------------------------
+    # RPC ACL
+    #
+    # Expose only the dedicated helper.
+    # Never expose /bin/sh or another general shell.
+    # --------------------------------------------------------
+
+    cat > "$MWAN3_SERVICE_ACL" <<'EOF_MWAN3_SERVICE_ACL'
+{
+    "luci-app-mwan3-service": {
+        "description": "Grant access to mwan3 service control",
+
+        "read": {
+            "file": {
+                "/usr/sbin/mwan3-service-control status": [
+                    "exec"
+                ]
+            },
+
+            "ubus": {
+                "file": [
+                    "exec"
+                ]
+            }
+        },
+
+        "write": {
+            "file": {
+                "/usr/sbin/mwan3-service-control enable": [
+                    "exec"
+                ],
+
+                "/usr/sbin/mwan3-service-control disable": [
+                    "exec"
+                ],
+
+                "/usr/sbin/mwan3-service-control start": [
+                    "exec"
+                ],
+
+                "/usr/sbin/mwan3-service-control stop": [
+                    "exec"
+                ],
+
+                "/usr/sbin/mwan3-service-control restart": [
+                    "exec"
+                ]
+            },
+
+            "ubus": {
+                "file": [
+                    "exec"
+                ]
+            }
+        }
+    }
+}
+EOF_MWAN3_SERVICE_ACL
+
+    # --------------------------------------------------------
+    # LuCI JavaScript view
+    # --------------------------------------------------------
+
+    cat > "$MWAN3_SERVICE_VIEW" <<'EOF_MWAN3_SERVICE_VIEW'
+'use strict';
+
+'require view';
+'require fs';
+'require ui';
+
+
+function parseStatus(output) {
+    output = output || '';
+
+    return {
+        available:
+            /Available:\s*yes/i.test(output),
+
+        boot:
+            /Boot:\s*enabled/i.test(output)
+                ? 'enabled'
+                : /Boot:\s*disabled/i.test(output)
+                    ? 'disabled'
+                    : 'unavailable',
+
+        runtime:
+            /Runtime:\s*running/i.test(output)
+                ? 'running'
+                : /Runtime:\s*stopped/i.test(output)
+                    ? 'stopped'
+                    : 'unavailable'
+    };
+}
+
+
+function setFeedback(kind, message, detail) {
+    var box =
+        document.getElementById(
+            'mwan3-service-feedback'
+        );
+
+    if (!box)
+        return;
+
+    while (box.firstChild)
+        box.removeChild(box.firstChild);
+
+    var labelText;
+    var labelClass;
+
+    switch (kind) {
+    case 'success':
+        labelText = _('Applied');
+        labelClass = 'label success';
+        break;
+
+    case 'error':
+        labelText = _('Error');
+        labelClass = 'label warning';
+        break;
+
+    case 'working':
+        labelText = _('Applying');
+        labelClass = 'label';
+        break;
+
+    default:
+        labelText = _('Notice');
+        labelClass = 'label';
+        break;
+    }
+
+    box.appendChild(
+        E(
+            'span',
+            {
+                'class': labelClass
+            },
+            labelText
+        )
+    );
+
+    box.appendChild(
+        document.createTextNode(
+            '  ' + message
+        )
+    );
+
+    if (detail) {
+        box.appendChild(
+            E(
+                'pre',
+                {
+                    'style':
+                        'white-space:pre-wrap;' +
+                        'margin:.75em 0 0 0;'
+                },
+                detail
+            )
+        );
+    }
+
+    box.style.display = 'block';
+}
+
+
+function storeFeedback(message) {
+    try {
+        window.sessionStorage.setItem(
+            'mwan3-service-feedback',
+            message
+        );
+    }
+    catch (e) {
+        /* Non-fatal. */
+    }
+}
+
+
+function restoreFeedback() {
+    var message = null;
+
+    try {
+        message =
+            window.sessionStorage.getItem(
+                'mwan3-service-feedback'
+            );
+
+        window.sessionStorage.removeItem(
+            'mwan3-service-feedback'
+        );
+    }
+    catch (e) {
+        /* Non-fatal. */
+    }
+
+    if (message)
+        setFeedback(
+            'success',
+            message
+        );
+}
+
+
+/*
+ * Align an interactive control to the actual rendered
+ * content position of a span inside a LuCI paragraph.
+ *
+ * This avoids theme-specific hard-coded margins:
+ *
+ *   Argon
+ *   Aurora
+ *   Material
+ *   OpenWrt themes
+ *
+ * can all have slightly different section / paragraph
+ * padding and margins.
+ */
+function alignControlToAnchor(anchorId, controlId) {
+    var anchor =
+        document.getElementById(anchorId);
+
+    var control =
+        document.getElementById(controlId);
+
+    if (!anchor || !control)
+        return;
+
+    control.style.marginInlineStart = '0px';
+
+    window.requestAnimationFrame(function() {
+        var targetLeft =
+            anchor.getBoundingClientRect().left;
+
+        var currentLeft =
+            control.getBoundingClientRect().left;
+
+        var delta =
+            Math.round(
+                targetLeft - currentLeft
+            );
+
+        /*
+         * Only compensate plausible theme layout offsets.
+         * Do not allow a future DOM/layout change to create
+         * an unexpectedly huge margin.
+         */
+        if (delta > 1 && delta < 64)
+            control.style.marginInlineStart =
+                delta + 'px';
+    });
+}
+
+
+function alignServiceControls() {
+    alignControlToAnchor(
+        'mwan3-service-boot-anchor',
+        'mwan3-service-boot-segment'
+    );
+
+    alignControlToAnchor(
+        'mwan3-service-runtime-anchor',
+        'mwan3-service-runtime-actions'
+    );
+}
+
+
+return view.extend({
+    available: false,
+
+    actualBoot: 'unavailable',
+    pendingBoot: 'unavailable',
+
+    runtime: 'unavailable',
+
+
+    /*
+     * No standalone Save button.
+     *
+     * Selecting boot enabled / disabled only stages the
+     * desired value.
+     *
+     * LuCI provides its native:
+     *
+     *   Save & Apply
+     *   Force / unchecked apply
+     *   Reset
+     */
+    handleSave: null,
+
+
+    load: function() {
+        return fs.exec(
+            '/usr/sbin/mwan3-service-control',
+            [ 'status' ]
+        ).catch(function(err) {
+            return {
+                code: 1,
+                stdout: '',
+                stderr: String(err)
+            };
+        });
+    },
+
+
+    updateBootSegment: function() {
+        var enable =
+            document.getElementById(
+                'mwan3-service-enable'
+            );
+
+        var disable =
+            document.getElementById(
+                'mwan3-service-disable'
+            );
+
+        if (!enable || !disable)
+            return;
+
+        var selected =
+            this.pendingBoot;
+
+        enable.setAttribute(
+            'aria-checked',
+            selected === 'enabled'
+                ? 'true'
+                : 'false'
+        );
+
+        disable.setAttribute(
+            'aria-checked',
+            selected === 'disabled'
+                ? 'true'
+                : 'false'
+        );
+
+        enable.className =
+            'btn ' +
+            (
+                selected === 'enabled'
+                    ? 'cbi-button-positive'
+                    : 'cbi-button-neutral'
+            );
+
+        disable.className =
+            'btn ' +
+            (
+                selected === 'disabled'
+                    ? 'cbi-button-positive'
+                    : 'cbi-button-neutral'
+            );
+    },
+
+
+    handleSelectBoot: function(which, ev) {
+        if (ev)
+            ev.preventDefault();
+
+        if (!this.available)
+            return false;
+
+        if (
+            which !== 'enabled' &&
+            which !== 'disabled'
+        )
+            return false;
+
+        /*
+         * Stage only.
+         * Do not change the init script yet.
+         */
+        this.pendingBoot =
+            which;
+
+        this.updateBootSegment();
+
+        var feedback =
+            document.getElementById(
+                'mwan3-service-feedback'
+            );
+
+        if (feedback)
+            feedback.style.display = 'none';
+
+        return false;
+    },
+
+
+    /*
+     * Native LuCI Save & Apply handler.
+     *
+     * This changes only boot-time autostart.
+     * It deliberately does NOT start or stop the currently
+     * running mwan3 service.
+     */
+    handleSaveApply: function(ev, applyMode) {
+        var self =
+            this;
+
+        var target =
+            this.pendingBoot;
+
+        var forceApply =
+            String(applyMode) === '1';
+
+        if (!this.available) {
+            setFeedback(
+                'error',
+                _('mwan3 is not available.')
+            );
+
+            return Promise.resolve();
+        }
+
+        if (
+            target !== 'enabled' &&
+            target !== 'disabled'
+        ) {
+            setFeedback(
+                'error',
+                _('Unknown boot state.')
+            );
+
+            return Promise.resolve();
+        }
+
+        if (
+            !forceApply &&
+            target === this.actualBoot
+        ) {
+            setFeedback(
+                'info',
+                _('No boot setting change to apply.')
+            );
+
+            return Promise.resolve();
+        }
+
+        var action =
+            target === 'enabled'
+                ? 'enable'
+                : 'disable';
+
+        var label =
+            target === 'enabled'
+                ? _('Enabled at boot')
+                : _('Disabled at boot');
+
+        setFeedback(
+            'working',
+            _('Applying boot setting...')
+        );
+
+        return fs.exec(
+            '/usr/sbin/mwan3-service-control',
+            [ action ]
+        ).then(function(res) {
+
+            if (
+                !res ||
+                res.code !== 0
+            ) {
+                setFeedback(
+                    'error',
+                    _('Failed to change the boot setting.'),
+                    (
+                        res &&
+                        (
+                            res.stderr ||
+                            res.stdout
+                        )
+                    ) ||
+                    _('Unknown error')
+                );
+
+                return;
+            }
+
+            self.actualBoot =
+                target;
+
+            self.pendingBoot =
+                target;
+
+            storeFeedback(
+                _('Boot setting changed to ') +
+                label +
+                '.'
+            );
+
+            window.location.reload();
+
+        }).catch(function(err) {
+
+            setFeedback(
+                'error',
+                _('Failed to change the boot setting.'),
+                String(err)
+            );
+        });
+    },
+
+
+    /*
+     * Native LuCI Reset button.
+     *
+     * Discard only the staged boot setting.
+     */
+    handleReset: function(ev) {
+        if (ev)
+            ev.preventDefault();
+
+        this.pendingBoot =
+            this.actualBoot;
+
+        this.updateBootSegment();
+
+        var feedback =
+            document.getElementById(
+                'mwan3-service-feedback'
+            );
+
+        if (feedback)
+            feedback.style.display = 'none';
+
+        return Promise.resolve();
+    },
+
+
+    /*
+     * Runtime actions are immediate.
+     *
+     * They do NOT modify the boot-time enable/disable state.
+     */
+    handleRuntimeAction: function(action, ev) {
+        if (ev)
+            ev.preventDefault();
+
+        if (!this.available) {
+            setFeedback(
+                'error',
+                _('mwan3 is not available.')
+            );
+
+            return Promise.resolve();
+        }
+
+        var actionLabel =
+            action === 'start'
+                ? _('Start')
+                : action === 'stop'
+                    ? _('Stop')
+                    : _('Restart');
+
+        setFeedback(
+            'working',
+            actionLabel +
+                ' mwan3...'
+        );
+
+        return fs.exec(
+            '/usr/sbin/mwan3-service-control',
+            [ action ]
+        ).then(function(res) {
+
+            if (
+                !res ||
+                res.code !== 0
+            ) {
+                setFeedback(
+                    'error',
+                    actionLabel +
+                        ' mwan3 ' +
+                        _('failed.'),
+                    (
+                        res &&
+                        (
+                            res.stderr ||
+                            res.stdout
+                        )
+                    ) ||
+                    _('Unknown error')
+                );
+
+                return;
+            }
+
+            var resultText =
+                action === 'start'
+                    ? _('mwan3 started.')
+                    : action === 'stop'
+                        ? _('mwan3 stopped.')
+                        : _('mwan3 restarted.');
+
+            storeFeedback(
+                resultText
+            );
+
+            window.location.reload();
+
+        }).catch(function(err) {
+
+            setFeedback(
+                'error',
+                actionLabel +
+                    ' mwan3 ' +
+                    _('failed.'),
+                String(err)
+            );
+        });
+    },
+
+
+    render: function(status) {
+        var parsed =
+            parseStatus(
+                status && status.stdout
+                    ? status.stdout
+                    : ''
+            );
+
+        var self =
+            this;
+
+        this.available =
+            parsed.available;
+
+        this.actualBoot =
+            parsed.boot;
+
+        this.pendingBoot =
+            parsed.boot;
+
+        this.runtime =
+            parsed.runtime;
+
+        /*
+         * Run after LuCI has inserted the view into the DOM.
+         */
+        window.setTimeout(
+            function() {
+                alignServiceControls();
+                restoreFeedback();
+            },
+            0
+        );
+
+
+        function bootButton(
+            which,
+            text,
+            left
+        ) {
+            var active =
+                self.pendingBoot === which;
+
+            return E(
+                'button',
+                {
+                    'id':
+                        'mwan3-service-' +
+                        (
+                            which === 'enabled'
+                                ? 'enable'
+                                : 'disable'
+                        ),
+
+                    'type':
+                        'button',
+
+                    'role':
+                        'radio',
+
+                    'aria-checked':
+                        active
+                            ? 'true'
+                            : 'false',
+
+                    'disabled':
+                        self.available
+                            ? null
+                            : 'disabled',
+
+                    'class':
+                        'btn ' +
+                        (
+                            active
+                                ? 'cbi-button-positive'
+                                : 'cbi-button-neutral'
+                        ),
+
+                    'style':
+                        left
+                            ? (
+                                'margin:0;' +
+                                'min-width:9em;' +
+                                'border-radius:.375em 0 0 .375em;'
+                              )
+                            : (
+                                'margin:0;' +
+                                'margin-left:-1px;' +
+                                'min-width:9em;' +
+                                'border-radius:0 .375em .375em 0;'
+                              ),
+
+                    'click':
+                        ui.createHandlerFn(
+                            self,
+                            'handleSelectBoot',
+                            which
+                        )
+                },
+
+                text
+            );
+        }
+
+
+        function actionButton(
+            action,
+            text,
+            positive,
+            disabled
+        ) {
+            return E(
+                'button',
+                {
+                    'type':
+                        'button',
+
+                    'class':
+                        'cbi-button ' +
+                        (
+                            positive
+                                ? 'cbi-button-positive'
+                                : 'cbi-button-action'
+                        ),
+
+                    'disabled':
+                        disabled
+                            ? 'disabled'
+                            : null,
+
+                    'style':
+                        'margin-right:.5em;',
+
+                    'click':
+                        ui.createHandlerFn(
+                            self,
+                            'handleRuntimeAction',
+                            action
+                        )
+                },
+
+                text
+            );
+        }
+
+
+        var bootLabel =
+            !parsed.available
+                ? _('Unavailable')
+                : parsed.boot === 'enabled'
+                    ? _('Enabled')
+                    : parsed.boot === 'disabled'
+                        ? _('Disabled')
+                        : _('Unknown');
+
+        var bootClass =
+            parsed.available &&
+            parsed.boot === 'enabled'
+                ? 'label success'
+                : 'label warning';
+
+
+        var runtimeLabel =
+            !parsed.available
+                ? _('Unavailable')
+                : parsed.runtime === 'running'
+                    ? _('Running')
+                    : parsed.runtime === 'stopped'
+                        ? _('Stopped')
+                        : _('Unknown');
+
+        var runtimeClass =
+            parsed.available &&
+            parsed.runtime === 'running'
+                ? 'label success'
+                : 'label warning';
+
+
+        return E(
+            'div',
+            {
+                'class':
+                    'cbi-map'
+            },
+            [
+                E(
+                    'h2',
+                    {},
+                    _(
+                        'MultiWAN Manager - Service Control'
+                    )
+                ),
+
+
+                E(
+                    'div',
+                    {
+                        'class':
+                            'cbi-map-descr'
+                    },
+                    _(
+                        'Control mwan3 boot-time autostart and its current runtime state. Boot settings are applied with Save & Apply; Start, Stop and Restart take effect immediately.'
+                    )
+                ),
+
+
+                E(
+                    'div',
+                    {
+                        'class':
+                            'cbi-section'
+                    },
+                    [
+                        E(
+                            'h3',
+                            {},
+                            _('Boot autostart')
+                        ),
+
+
+                        E(
+                            'p',
+                            {},
+                            E(
+                                'span',
+                                {
+                                    'id':
+                                        'mwan3-service-boot-anchor'
+                                },
+                                [
+                                    document.createTextNode(
+                                        _('Current status:') +
+                                        ' '
+                                    ),
+
+                                    E(
+                                        'span',
+                                        {
+                                            'class':
+                                                bootClass
+                                        },
+                                        bootLabel
+                                    )
+                                ]
+                            )
+                        ),
+
+
+                        E(
+                            'div',
+                            {
+                                'id':
+                                    'mwan3-service-boot-segment',
+
+                                'role':
+                                    'radiogroup',
+
+                                'aria-label':
+                                    _(
+                                        'mwan3 boot autostart'
+                                    ),
+
+                                'style':
+                                    'display:inline-flex;' +
+                                    'align-items:stretch;' +
+                                    'max-width:100%;' +
+                                    'margin-top:.5em;' +
+                                    'margin-bottom:.75em;'
+                            },
+                            [
+                                bootButton(
+                                    'enabled',
+                                    _('Enable at boot'),
+                                    true
+                                ),
+
+                                bootButton(
+                                    'disabled',
+                                    _('Disable at boot'),
+                                    false
+                                )
+                            ]
+                        ),
+
+
+                        E(
+                            'div',
+                            {
+                                'class':
+                                    'cbi-section-descr'
+                            },
+                            _(
+                                'This setting only controls whether mwan3 starts automatically on the next boot. It does not start or stop the service in the current session.'
+                            )
+                        )
+                    ]
+                ),
+
+
+                E(
+                    'div',
+                    {
+                        'class':
+                            'cbi-section'
+                    },
+                    [
+                        E(
+                            'h3',
+                            {},
+                            _('Current runtime state')
+                        ),
+
+
+                        E(
+                            'p',
+                            {},
+                            E(
+                                'span',
+                                {
+                                    'id':
+                                        'mwan3-service-runtime-anchor'
+                                },
+                                [
+                                    document.createTextNode(
+                                        _('Current status:') +
+                                        ' '
+                                    ),
+
+                                    E(
+                                        'span',
+                                        {
+                                            'class':
+                                                runtimeClass
+                                        },
+                                        runtimeLabel
+                                    )
+                                ]
+                            )
+                        ),
+
+
+                        /*
+                         * Do not use a bare <p> for the action row.
+                         *
+                         * Argon / Aurora have different default
+                         * paragraph margins. Explicit spacing here
+                         * keeps the two themes visually consistent.
+                         */
+                        E(
+                            'div',
+                            {
+                                'id':
+                                    'mwan3-service-runtime-actions',
+
+                                'style':
+                                    'display:flex;' +
+                                    'align-items:center;' +
+                                    'flex-wrap:wrap;' +
+                                    'margin-top:.75em;' +
+                                    'margin-bottom:1em;'
+                            },
+                            [
+                                actionButton(
+                                    'start',
+                                    _('Start'),
+                                    true,
+                                    !parsed.available ||
+                                    parsed.runtime === 'running'
+                                ),
+
+                                actionButton(
+                                    'stop',
+                                    _('Stop'),
+                                    false,
+                                    !parsed.available ||
+                                    parsed.runtime === 'stopped'
+                                ),
+
+                                actionButton(
+                                    'restart',
+                                    _('Restart'),
+                                    false,
+                                    !parsed.available
+                                )
+                            ]
+                        ),
+
+
+                        E(
+                            'div',
+                            {
+                                'class':
+                                    'cbi-section-descr'
+                            },
+                            _(
+                                'Stop only affects the current session. If boot autostart remains enabled, mwan3 will start again after the router is rebooted.'
+                            )
+                        )
+                    ]
+                ),
+
+
+                E(
+                    'div',
+                    {
+                        'id':
+                            'mwan3-service-feedback',
+
+                        'class':
+                            'cbi-section-descr',
+
+                        'style':
+                            'display:none;' +
+                            'margin-top:.5em;' +
+                            'margin-bottom:1.25em;'
+                    }
+                )
+            ]
+        );
+    }
+});
+EOF_MWAN3_SERVICE_VIEW
+
+    chmod 0644 "$MWAN3_SERVICE_VIEW"
+    chmod 0644 "$MWAN3_SERVICE_MENU"
+    chmod 0644 "$MWAN3_SERVICE_ACL"
+
+    # Helper itself must remain executable.
+    chmod 0755 "$MWAN3_SERVICE_HELPER"
+
+    # --------------------------------------------------------
+    # Simplified Chinese translations
+    #
+    # Reuse the translation helper and PO file already created
+    # by the Mode Switch integration above.
+    # --------------------------------------------------------
+
+    add_mwan3_zh_translation \
+        "Service Control" \
+        "服务控制"
+
+    add_mwan3_zh_translation \
+        "MultiWAN Manager - Service Control" \
+        "MultiWAN 管理器 - 服务控制"
+
+    add_mwan3_zh_translation \
+        "Boot autostart" \
+        "开机自启动"
+
+    add_mwan3_zh_translation \
+        "Current runtime state" \
+        "当前运行状态"
+
+    add_mwan3_zh_translation \
+        "Current status:" \
+        "当前状态："
+
+    add_mwan3_zh_translation \
+        "mwan3 boot autostart" \
+        "mwan3 开机自启动"
+
+    add_mwan3_zh_translation \
+        "Enable at boot" \
+        "开机自启动"
+
+    add_mwan3_zh_translation \
+        "Disable at boot" \
+        "不开机自启动"
+
+    add_mwan3_zh_translation \
+        "Enabled" \
+        "已启用"
+
+    add_mwan3_zh_translation \
+        "Disabled" \
+        "已禁用"
+
+    add_mwan3_zh_translation \
+        "Enabled at boot" \
+        "开机自启动"
+
+    add_mwan3_zh_translation \
+        "Disabled at boot" \
+        "不开机自启动"
+
+    add_mwan3_zh_translation \
+        "Running" \
+        "运行中"
+
+    add_mwan3_zh_translation \
+        "Stopped" \
+        "已停止"
+
+    add_mwan3_zh_translation \
+        "Unavailable" \
+        "不可用"
+
+    add_mwan3_zh_translation \
+        "Start" \
+        "启动"
+
+    add_mwan3_zh_translation \
+        "Stop" \
+        "停止"
+
+    add_mwan3_zh_translation \
+        "Restart" \
+        "重启"
+
+    add_mwan3_zh_translation \
+        "mwan3 is not available." \
+        "mwan3 当前不可用。"
+
+    add_mwan3_zh_translation \
+        "Unknown boot state." \
+        "无法确定目标启动状态。"
+
+    add_mwan3_zh_translation \
+        "No boot setting change to apply." \
+        "开机自启动设置没有变化。"
+
+    add_mwan3_zh_translation \
+        "Applying boot setting..." \
+        "正在应用开机自启动设置……"
+
+    add_mwan3_zh_translation \
+        "Failed to change the boot setting." \
+        "修改开机自启动设置失败。"
+
+    add_mwan3_zh_translation \
+        "Boot setting changed to " \
+        "已设置为"
+
+    add_mwan3_zh_translation \
+        "failed." \
+        "失败。"
+
+    add_mwan3_zh_translation \
+        "mwan3 started." \
+        "mwan3 已启动。"
+
+    add_mwan3_zh_translation \
+        "mwan3 stopped." \
+        "mwan3 已停止。"
+
+    add_mwan3_zh_translation \
+        "mwan3 restarted." \
+        "mwan3 已重启。"
+
+    add_mwan3_zh_translation \
+        "Control mwan3 boot-time autostart and its current runtime state. Boot settings are applied with Save & Apply; Start, Stop and Restart take effect immediately." \
+        "控制 mwan3 的开机自启动与当前运行状态。开机自启动设置在“保存并应用”后生效；启动、停止、重启会立即执行。"
+
+    add_mwan3_zh_translation \
+        "This setting only controls whether mwan3 starts automatically on the next boot. It does not start or stop the service in the current session." \
+        "这里只控制下一次开机是否自动启动 mwan3，不会自动停止或启动当前会话中的 mwan3。"
+
+    add_mwan3_zh_translation \
+        "Stop only affects the current session. If boot autostart remains enabled, mwan3 will start again after the router is rebooted." \
+        "“停止”只影响本次运行；如果仍启用了开机自启动，下次重启路由器时 mwan3 仍会自动启动。"
+
+    echo "OK: LuCI mwan3 service control page installed"
+    echo "  Network -> MultiWAN Manager -> Service Control"
+    echo "  Chinese UI -> 服务控制"
+
 fi
 
 
