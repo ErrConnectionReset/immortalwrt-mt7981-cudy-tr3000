@@ -542,10 +542,13 @@ echo "  mwan3-mode status"
 #   Network -> MultiWAN Manager -> Mode Switch
 #
 # UI:
-#   Segmented Control
-#   [ Failover ] [ Load Balancing ]
-#
-# Uses LuCI native theme classes and i18n.
+#   - Segmented Control
+#   - Native LuCI Save & Apply / Force Apply / Reset
+#   - Staged selection: selecting a mode does not apply it
+#   - Inline operation status instead of modal notifications
+#   - Success message survives the post-apply page reload
+#   - Theme-independent alignment for Argon / Aurora / etc.
+#   - Native LuCI i18n
 # ============================================================
 
 echo "============================================================"
@@ -586,7 +589,7 @@ else
     mkdir -p "$(dirname "$MWAN3_MODE_ZH")"
 
     # --------------------------------------------------------
-    # Menu
+    # LuCI menu
     # --------------------------------------------------------
 
     cat > "$MWAN3_MODE_MENU" <<'EOF_MWAN3_MODE_MENU'
@@ -610,28 +613,40 @@ EOF_MWAN3_MODE_MENU
     # --------------------------------------------------------
     # RPC ACL
     #
-    # Only permit the three dedicated helper commands.
-    # Never expose /bin/sh or another generic shell.
+    # Only expose the dedicated mwan3-mode helper.
+    # Never expose /bin/sh or another general shell.
     # --------------------------------------------------------
 
     cat > "$MWAN3_MODE_ACL" <<'EOF_MWAN3_MODE_ACL'
 {
     "luci-app-mwan3-mode": {
         "description": "Grant access to mwan3 mode switching",
+
         "read": {
             "file": {
                 "/usr/sbin/mwan3-mode status": [
                     "exec"
-                ],
-                "/usr/sbin/mwan3-mode failover": [
-                    "exec"
-                ],
-                "/usr/sbin/mwan3-mode balance": [
+                ]
+            },
+
+            "ubus": {
+                "file": [
                     "exec"
                 ]
             }
         },
+
         "write": {
+            "file": {
+                "/usr/sbin/mwan3-mode failover": [
+                    "exec"
+                ],
+
+                "/usr/sbin/mwan3-mode balance": [
+                    "exec"
+                ]
+            },
+
             "ubus": {
                 "file": [
                     "exec"
@@ -687,10 +702,200 @@ function modeLabel(mode) {
 }
 
 
+function format1(text, value) {
+    return text.replace('%s', value);
+}
+
+
+/*
+ * Theme-independent alignment.
+ *
+ * Argon and Aurora use slightly different content offsets.
+ * Instead of detecting a specific theme or hard-coding a
+ * permanent margin, measure the actual rendered position of
+ * the current-mode badge and align the segmented control to it.
+ */
+function alignSegmentToContent() {
+    var anchor =
+        document.getElementById(
+            'mwan3-mode-status-anchor'
+        );
+
+    var segment =
+        document.getElementById(
+            'mwan3-mode-segment'
+        );
+
+    if (!anchor || !segment)
+        return;
+
+    segment.style.marginInlineStart = '0px';
+
+    window.requestAnimationFrame(function() {
+        var targetLeft =
+            anchor.getBoundingClientRect().left;
+
+        var currentLeft =
+            segment.getBoundingClientRect().left;
+
+        var delta =
+            Math.round(
+                targetLeft - currentLeft
+            );
+
+        /*
+         * Compensate only for a small layout offset.
+         *
+         * Aurora generally yields approximately zero.
+         * Argon may yield a small positive value.
+         */
+        if (delta > 1 && delta < 64)
+            segment.style.marginInlineStart =
+                delta + 'px';
+    });
+}
+
+
+/*
+ * Inline operation feedback.
+ *
+ * No modal or dismissable notification is used.
+ * This avoids visual conflicts with the reload performed
+ * after a successful mode switch.
+ */
+function setFeedback(kind, message, detail) {
+    var box =
+        document.getElementById(
+            'mwan3-mode-feedback'
+        );
+
+    if (!box)
+        return;
+
+    while (box.firstChild)
+        box.removeChild(box.firstChild);
+
+    var labelText;
+    var labelClass;
+
+    switch (kind) {
+    case 'success':
+        labelText = _('Applied');
+        labelClass = 'label success';
+        break;
+
+    case 'error':
+        labelText = _('Error');
+        labelClass = 'label warning';
+        break;
+
+    case 'working':
+        labelText = _('Applying');
+        labelClass = 'label';
+        break;
+
+    default:
+        labelText = _('Notice');
+        labelClass = 'label';
+        break;
+    }
+
+    box.appendChild(
+        E(
+            'span',
+            {
+                'class': labelClass
+            },
+            labelText
+        )
+    );
+
+    box.appendChild(
+        document.createTextNode(
+            '  ' + message
+        )
+    );
+
+    if (detail) {
+        box.appendChild(
+            E(
+                'pre',
+                {
+                    'style':
+                        'white-space:pre-wrap;' +
+                        'margin:.75em 0 0 0;'
+                },
+                detail
+            )
+        );
+    }
+
+    box.style.display = 'block';
+}
+
+
+/*
+ * Preserve one success message across window.location.reload().
+ *
+ * sessionStorage is tab-local and survives reload, but does
+ * not permanently persist.
+ */
+function storeFeedback(message) {
+    try {
+        window.sessionStorage.setItem(
+            'mwan3-mode-feedback',
+            message
+        );
+    }
+    catch (e) {
+        /* Non-fatal. */
+    }
+}
+
+
+function restoreFeedback() {
+    var message = null;
+
+    try {
+        message =
+            window.sessionStorage.getItem(
+                'mwan3-mode-feedback'
+            );
+
+        window.sessionStorage.removeItem(
+            'mwan3-mode-feedback'
+        );
+    }
+    catch (e) {
+        /* Non-fatal. */
+    }
+
+    if (message)
+        setFeedback(
+            'success',
+            message
+        );
+}
+
+
 return view.extend({
+    actualMode: 'unknown',
+    pendingMode: 'unknown',
+
+
+    /*
+     * No standalone Save button.
+     *
+     * Selecting Failover / Load Balancing only stages the
+     * desired value in the browser.
+     *
+     * LuCI provides its native:
+     *
+     *   Save & Apply
+     *   Force / unchecked apply
+     *   Reset
+     */
     handleSave: null,
-    handleSaveApply: null,
-    handleReset: null,
 
 
     load: function() {
@@ -707,89 +912,249 @@ return view.extend({
     },
 
 
-    handleSwitch: function(mode) {
-        var label = modeLabel(mode);
+    updateSegment: function() {
+        var failover =
+            document.getElementById(
+                'mwan3-mode-failover'
+            );
 
-        ui.showModal(
-            _('Switching mode'),
-            [
-                E(
-                    'p',
-                    { 'class': 'spinning' },
-                    _('Switching to %s ...').format(label)
-                )
-            ]
+        var balance =
+            document.getElementById(
+                'mwan3-mode-balance'
+            );
+
+        if (!failover || !balance)
+            return;
+
+        var selected =
+            this.pendingMode;
+
+
+        failover.setAttribute(
+            'aria-checked',
+            selected === 'failover'
+                ? 'true'
+                : 'false'
         );
+
+        balance.setAttribute(
+            'aria-checked',
+            selected === 'balance'
+                ? 'true'
+                : 'false'
+        );
+
+
+        failover.className =
+            'btn ' +
+            (
+                selected === 'failover'
+                    ? 'cbi-button-positive'
+                    : 'cbi-button-neutral'
+            );
+
+
+        balance.className =
+            'btn ' +
+            (
+                selected === 'balance'
+                    ? 'cbi-button-positive'
+                    : 'cbi-button-neutral'
+            );
+    },
+
+
+    handleSelectMode: function(mode, ev) {
+        if (ev)
+            ev.preventDefault();
+
+        if (
+            mode !== 'failover' &&
+            mode !== 'balance'
+        )
+            return false;
+
+        /*
+         * Stage only.
+         * Do not change mwan3 yet.
+         */
+        this.pendingMode = mode;
+
+        this.updateSegment();
+
+        /*
+         * Clear stale feedback when making a new selection.
+         */
+        var feedback =
+            document.getElementById(
+                'mwan3-mode-feedback'
+            );
+
+        if (feedback)
+            feedback.style.display = 'none';
+
+        return false;
+    },
+
+
+    /*
+     * Native LuCI Save & Apply handler.
+     *
+     * A normal apply avoids restarting mwan3 if the selected
+     * mode is already active.
+     *
+     * LuCI's force/unchecked apply action re-runs the helper
+     * even if the selected mode is already active.
+     */
+    handleSaveApply: function(ev, applyMode) {
+        var self = this;
+
+        var target =
+            this.pendingMode;
+
+        var forceApply =
+            String(applyMode) === '1';
+
+
+        if (
+            target !== 'failover' &&
+            target !== 'balance'
+        ) {
+            setFeedback(
+                'error',
+                _('Unknown error')
+            );
+
+            return Promise.resolve();
+        }
+
+
+        if (
+            !forceApply &&
+            target === this.actualMode
+        ) {
+            setFeedback(
+                'info',
+                _('No mode change to apply.')
+            );
+
+            return Promise.resolve();
+        }
+
+
+        var label =
+            modeLabel(target);
+
+
+        setFeedback(
+            'working',
+            format1(
+                _('Applying %s ...'),
+                label
+            )
+        );
+
 
         return fs.exec(
             '/usr/sbin/mwan3-mode',
-            [ mode ]
+            [ target ]
         ).then(function(res) {
 
-            ui.hideModal();
-
-            if (!res || res.code !== 0) {
+            if (
+                !res ||
+                res.code !== 0
+            ) {
                 var output =
-                    (res && (res.stderr || res.stdout)) ||
+                    (
+                        res &&
+                        (
+                            res.stderr ||
+                            res.stdout
+                        )
+                    ) ||
                     _('Unknown error');
 
-                ui.addNotification(
-                    null,
-                    E('div', {}, [
-                        E(
-                            'p',
-                            {},
-                            _('Failed to switch to %s.')
-                                .format(label)
-                        ),
 
-                        E(
-                            'pre',
-                            {
-                                'style':
-                                    'white-space:pre-wrap;' +
-                                    'margin-top:.5em;'
-                            },
-                            output
-                        )
-                    ]),
-                    'danger'
+                setFeedback(
+                    'error',
+                    format1(
+                        _('Failed to switch to %s.'),
+                        label
+                    ),
+                    output
                 );
 
                 return;
             }
 
-            ui.addNotification(
-                null,
-                E(
-                    'p',
-                    {},
-                    _('Switched to %s.').format(label)
-                ),
-                'info'
+
+            var wasSame =
+                target === self.actualMode;
+
+
+            self.actualMode =
+                target;
+
+            self.pendingMode =
+                target;
+
+
+            /*
+             * Do not show a transient success popup here.
+             *
+             * Store the success text first, reload immediately,
+             * then restore the message inline on the new page.
+             */
+            storeFeedback(
+                format1(
+                    wasSame
+                        ? _('Re-applied %s.')
+                        : _('Switched to %s.'),
+                    label
+                )
             );
 
-            window.setTimeout(function() {
-                window.location.reload();
-            }, 500);
+
+            window.location.reload();
 
         }).catch(function(err) {
 
-            ui.hideModal();
-
-            ui.addNotification(
-                null,
-                E(
-                    'p',
-                    {},
-                    _('Failed to switch to %s.')
-                        .format(label) +
-                    ' ' +
-                    String(err)
+            setFeedback(
+                'error',
+                format1(
+                    _('Failed to switch to %s.'),
+                    label
                 ),
-                'danger'
+                String(err)
             );
         });
+    },
+
+
+    /*
+     * Native LuCI Reset button.
+     *
+     * Discard the staged selection and return the segmented
+     * control to the currently applied mode.
+     */
+    handleReset: function(ev) {
+        if (ev)
+            ev.preventDefault();
+
+        this.pendingMode =
+            this.actualMode;
+
+        this.updateSegment();
+
+        var feedback =
+            document.getElementById(
+                'mwan3-mode-feedback'
+            );
+
+        if (feedback)
+            feedback.style.display = 'none';
+
+        return Promise.resolve();
     },
 
 
@@ -799,101 +1164,91 @@ return view.extend({
                 ? status.stdout
                 : '';
 
-        var mode = parseMode(output);
+        var mode =
+            parseMode(output);
 
-        var self = this;
+        var self =
+            this;
+
+
+        this.actualMode =
+            mode;
+
+        this.pendingMode =
+            mode;
+
 
         /*
-         * Segmented Control
-         *
-         * Interaction semantics:
-         *   radiogroup / radio
-         *
-         * Appearance:
-         *   LuCI native button classes
-         *
-         * No hard-coded colors are used, so the active theme
-         * controls the actual appearance.
+         * Run after LuCI has inserted the view into the DOM.
          */
-
-        var failoverButton = E(
-            'button',
-            {
-                'type': 'button',
-
-                'role': 'radio',
-
-                'aria-checked':
-                    mode === 'failover'
-                        ? 'true'
-                        : 'false',
-
-                'class':
-                    mode === 'failover'
-                        ? 'btn cbi-button-positive'
-                        : 'btn cbi-button-neutral',
-
-                'style':
-                    'margin:0;' +
-                    'border-radius:.375em 0 0 .375em;',
-
-                'click':
-                    mode === 'failover'
-                        ? function(ev) {
-                            ev.preventDefault();
-                            return false;
-                        }
-                        : ui.createHandlerFn(
-                            self,
-                            'handleSwitch',
-                            'failover'
-                        )
+        window.setTimeout(
+            function() {
+                alignSegmentToContent();
+                restoreFeedback();
             },
-
-            _('Failover')
+            0
         );
 
 
-        var balanceButton = E(
-            'button',
-            {
-                'type': 'button',
+        function button(which) {
+            var active =
+                self.pendingMode === which;
 
-                'role': 'radio',
 
-                'aria-checked':
-                    mode === 'balance'
-                        ? 'true'
-                        : 'false',
+            return E(
+                'button',
+                {
+                    'id':
+                        'mwan3-mode-' +
+                        which,
 
-                'class':
-                    mode === 'balance'
-                        ? 'btn cbi-button-positive'
-                        : 'btn cbi-button-neutral',
+                    'type':
+                        'button',
 
-                'style':
-                    'margin:0;' +
-                    'margin-left:-1px;' +
-                    'border-radius:0 .375em .375em 0;',
+                    'role':
+                        'radio',
 
-                'click':
-                    mode === 'balance'
-                        ? function(ev) {
-                            ev.preventDefault();
-                            return false;
-                        }
-                        : ui.createHandlerFn(
+                    'aria-checked':
+                        active
+                            ? 'true'
+                            : 'false',
+
+                    'class':
+                        'btn ' +
+                        (
+                            active
+                                ? 'cbi-button-positive'
+                                : 'cbi-button-neutral'
+                        ),
+
+                    'style':
+                        which === 'failover'
+                            ? (
+                                'margin:0;' +
+                                'min-width:9em;' +
+                                'border-radius:.375em 0 0 .375em;'
+                              )
+                            : (
+                                'margin:0;' +
+                                'margin-left:-1px;' +
+                                'min-width:9em;' +
+                                'border-radius:0 .375em .375em 0;'
+                              ),
+
+                    'click':
+                        ui.createHandlerFn(
                             self,
-                            'handleSwitch',
-                            'balance'
+                            'handleSelectMode',
+                            which
                         )
-            },
+                },
 
-            _('Load Balancing')
-        );
+                modeLabel(which)
+            );
+        }
 
 
-        var modeClass =
+        var statusClass =
             mode === 'failover' ||
             mode === 'balance'
                 ? 'label success'
@@ -902,25 +1257,38 @@ return view.extend({
 
         return E(
             'div',
-            { 'class': 'cbi-map' },
+            {
+                'class':
+                    'cbi-map'
+            },
             [
                 E(
                     'h2',
                     {},
-                    _('MultiWAN Manager - Mode Switch')
+                    _(
+                        'MultiWAN Manager - Mode Switch'
+                    )
                 ),
+
 
                 E(
                     'div',
-                    { 'class': 'cbi-map-descr' },
+                    {
+                        'class':
+                            'cbi-map-descr'
+                    },
                     _(
                         'Switch between the predefined failover and load-balancing policies.'
                     )
                 ),
 
+
                 E(
                     'div',
-                    { 'class': 'cbi-section' },
+                    {
+                        'class':
+                            'cbi-section'
+                    },
                     [
                         E(
                             'h3',
@@ -928,39 +1296,81 @@ return view.extend({
                             _('Current mode')
                         ),
 
+
                         E(
                             'p',
                             {},
-                            [
-                                E(
-                                    'span',
-                                    {
-                                        'class': modeClass
-                                    },
-                                    modeLabel(mode)
-                                )
-                            ]
+                            E(
+                                'span',
+                                {
+                                    'id':
+                                        'mwan3-mode-status-anchor',
+
+                                    'class':
+                                        statusClass
+                                },
+                                modeLabel(mode)
+                            )
                         ),
+
 
                         E(
                             'div',
                             {
-                                'role': 'radiogroup',
+                                'id':
+                                    'mwan3-mode-segment',
+
+                                'role':
+                                    'radiogroup',
 
                                 'aria-label':
-                                    _('MultiWAN mode'),
+                                    _(
+                                        'MultiWAN mode'
+                                    ),
 
                                 'style':
                                     'display:inline-flex;' +
                                     'align-items:stretch;' +
+                                    'max-width:100%;' +
                                     'margin-top:.5em;' +
-                                    'margin-bottom:1.25em;'
+                                    'margin-bottom:.75em;'
                             },
                             [
-                                failoverButton,
-                                balanceButton
+                                button(
+                                    'failover'
+                                ),
+
+                                button(
+                                    'balance'
+                                )
                             ]
                         ),
+
+
+                        /*
+                         * Inline operation result.
+                         *
+                         * Hidden by default.
+                         *
+                         * Success is displayed here after reload.
+                         * Errors remain here without reloading.
+                         */
+                        E(
+                            'div',
+                            {
+                                'id':
+                                    'mwan3-mode-feedback',
+
+                                'class':
+                                    'cbi-section-descr',
+
+                                'style':
+                                    'display:none;' +
+                                    'margin-top:.25em;' +
+                                    'margin-bottom:1.25em;'
+                            }
+                        ),
+
 
                         E(
                             'div',
@@ -976,7 +1386,10 @@ return view.extend({
                                         E(
                                             'strong',
                                             {},
-                                            _('Failover') + ': '
+                                            _(
+                                                'Failover'
+                                            ) +
+                                            ': '
                                         ),
 
                                         _(
@@ -985,6 +1398,7 @@ return view.extend({
                                     ]
                                 ),
 
+
                                 E(
                                     'p',
                                     {},
@@ -992,7 +1406,10 @@ return view.extend({
                                         E(
                                             'strong',
                                             {},
-                                            _('Load Balancing') + ': '
+                                            _(
+                                                'Load Balancing'
+                                            ) +
+                                            ': '
                                         ),
 
                                         _(
@@ -1001,11 +1418,12 @@ return view.extend({
                                     ]
                                 ),
 
+
                                 E(
                                     'p',
                                     {},
                                     _(
-                                        'Switching updates the IPv4 default rule, HTTPS sticky rule and the configured IPv6 default rule.'
+                                        'Applying updates the IPv4 default rule, HTTPS sticky rule and the configured IPv6 default rule.'
                                     )
                                 )
                             ]
@@ -1025,17 +1443,19 @@ EOF_MWAN3_MODE_VIEW
     # --------------------------------------------------------
     # Simplified Chinese translation
     #
-    # English strings above are the canonical msgid values.
-    # LuCI automatically uses the Chinese translations below
-    # when the UI language is Simplified Chinese.
+    # English msgid values are the canonical source strings.
+    # luci-i18n-mwan3-zh-cn will compile these PO entries into
+    # the runtime LMO translation.
     # --------------------------------------------------------
 
     if [ ! -f "$MWAN3_MODE_ZH" ]; then
+
         cat > "$MWAN3_MODE_ZH" <<'EOF_MWAN3_PO_HEADER'
 msgid ""
 msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 EOF_MWAN3_PO_HEADER
+
     fi
 
 
@@ -1043,10 +1463,12 @@ EOF_MWAN3_PO_HEADER
         MSGID="$1"
         MSGSTR="$2"
 
-        if ! grep -Fqx "msgid \"$MSGID\"" \
+        if ! grep -Fqx \
+            "msgid \"$MSGID\"" \
             "$MWAN3_MODE_ZH"; then
 
-            printf '\nmsgid "%s"\nmsgstr "%s"\n' \
+            printf \
+                '\nmsgid "%s"\nmsgstr "%s"\n' \
                 "$MSGID" \
                 "$MSGSTR" \
                 >> "$MWAN3_MODE_ZH"
@@ -1087,20 +1509,40 @@ EOF_MWAN3_PO_HEADER
         "未知"
 
     add_mwan3_zh_translation \
-        "Switching mode" \
-        "正在切换模式"
+        "Applying" \
+        "正在应用"
 
     add_mwan3_zh_translation \
-        "Switching to %s ..." \
-        "正在切换到 %s……"
+        "Applied" \
+        "已应用"
+
+    add_mwan3_zh_translation \
+        "Notice" \
+        "提示"
+
+    add_mwan3_zh_translation \
+        "Error" \
+        "错误"
+
+    add_mwan3_zh_translation \
+        "Applying %s ..." \
+        "正在应用 %s……"
 
     add_mwan3_zh_translation \
         "Switched to %s." \
         "已切换到 %s。"
 
     add_mwan3_zh_translation \
+        "Re-applied %s." \
+        "已重新应用 %s。"
+
+    add_mwan3_zh_translation \
         "Failed to switch to %s." \
         "切换到 %s 失败。"
+
+    add_mwan3_zh_translation \
+        "No mode change to apply." \
+        "没有需要应用的模式变更。"
 
     add_mwan3_zh_translation \
         "Unknown error" \
@@ -1119,8 +1561,8 @@ EOF_MWAN3_PO_HEADER
         "WAN 与 USB WAN 同时参与连接分流，并按照预设的 3:1 权重分配。"
 
     add_mwan3_zh_translation \
-        "Switching updates the IPv4 default rule, HTTPS sticky rule and the configured IPv6 default rule." \
-        "切换会同时更新 IPv4 默认规则、HTTPS Sticky 规则以及已配置的 IPv6 默认规则。"
+        "Applying updates the IPv4 default rule, HTTPS sticky rule and the configured IPv6 default rule." \
+        "应用时会同时更新 IPv4 默认规则、HTTPS Sticky 规则以及已配置的 IPv6 默认规则。"
 
 
     echo "OK: LuCI mwan3 mode switch page installed"
