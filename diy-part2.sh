@@ -534,6 +534,602 @@ echo "  mwan3-mode failover"
 echo "  mwan3-mode balance"
 echo "  mwan3-mode status"
 
+
+# ============================================================
+# LuCI mwan3 mode switch integration
+#
+# Adds:
+#   Network -> MultiWAN Manager -> Mode Switch
+#
+# UI:
+#   Segmented Control
+#   [ Failover ] [ Load Balancing ]
+#
+# Uses LuCI native theme classes and i18n.
+# ============================================================
+
+echo "============================================================"
+echo " Installing LuCI mwan3 mode switch page"
+echo "============================================================"
+
+MWAN3_LUCI_DIR=""
+
+for d in \
+    "feeds/luci/applications/luci-app-mwan3" \
+    "package/feeds/luci/luci-app-mwan3" \
+    "package/luci-app-mwan3"
+do
+    if [ -d "$d" ]; then
+        MWAN3_LUCI_DIR="$d"
+        break
+    fi
+done
+
+if [ -z "$MWAN3_LUCI_DIR" ]; then
+
+    echo "WARNING: luci-app-mwan3 source not found;"
+    echo "         LuCI mode switch page skipped"
+
+else
+
+    echo "Found luci-app-mwan3:"
+    echo "  $MWAN3_LUCI_DIR"
+
+    MWAN3_MODE_VIEW="$MWAN3_LUCI_DIR/htdocs/luci-static/resources/view/mwan3/network/mode.js"
+    MWAN3_MODE_MENU="$MWAN3_LUCI_DIR/root/usr/share/luci/menu.d/luci-app-mwan3-mode.json"
+    MWAN3_MODE_ACL="$MWAN3_LUCI_DIR/root/usr/share/rpcd/acl.d/luci-app-mwan3-mode.json"
+    MWAN3_MODE_ZH="$MWAN3_LUCI_DIR/po/zh_Hans/mwan3.po"
+
+    mkdir -p "$(dirname "$MWAN3_MODE_VIEW")"
+    mkdir -p "$(dirname "$MWAN3_MODE_MENU")"
+    mkdir -p "$(dirname "$MWAN3_MODE_ACL")"
+    mkdir -p "$(dirname "$MWAN3_MODE_ZH")"
+
+    # --------------------------------------------------------
+    # Menu
+    # --------------------------------------------------------
+
+    cat > "$MWAN3_MODE_MENU" <<'EOF_MWAN3_MODE_MENU'
+{
+    "admin/network/mwan3/mode": {
+        "title": "Mode Switch",
+        "order": 110,
+        "action": {
+            "type": "view",
+            "path": "mwan3/network/mode"
+        },
+        "depends": {
+            "acl": [
+                "luci-app-mwan3-mode"
+            ]
+        }
+    }
+}
+EOF_MWAN3_MODE_MENU
+
+    # --------------------------------------------------------
+    # RPC ACL
+    #
+    # Only permit the three dedicated helper commands.
+    # Never expose /bin/sh or another generic shell.
+    # --------------------------------------------------------
+
+    cat > "$MWAN3_MODE_ACL" <<'EOF_MWAN3_MODE_ACL'
+{
+    "luci-app-mwan3-mode": {
+        "description": "Grant access to mwan3 mode switching",
+        "read": {
+            "file": {
+                "/usr/sbin/mwan3-mode status": [
+                    "exec"
+                ],
+                "/usr/sbin/mwan3-mode failover": [
+                    "exec"
+                ],
+                "/usr/sbin/mwan3-mode balance": [
+                    "exec"
+                ]
+            }
+        },
+        "write": {
+            "ubus": {
+                "file": [
+                    "exec"
+                ]
+            }
+        }
+    }
+}
+EOF_MWAN3_MODE_ACL
+
+    # --------------------------------------------------------
+    # LuCI JavaScript view
+    # --------------------------------------------------------
+
+    cat > "$MWAN3_MODE_VIEW" <<'EOF_MWAN3_MODE_VIEW'
+'use strict';
+
+'require view';
+'require fs';
+'require ui';
+
+
+function parseMode(output) {
+    output = output || '';
+
+    if (/Mode:\s*failover/i.test(output))
+        return 'failover';
+
+    if (/Mode:\s*balance/i.test(output))
+        return 'balance';
+
+    if (/Mode:\s*mixed\/custom/i.test(output))
+        return 'mixed';
+
+    return 'unknown';
+}
+
+
+function modeLabel(mode) {
+    switch (mode) {
+    case 'failover':
+        return _('Failover');
+
+    case 'balance':
+        return _('Load Balancing');
+
+    case 'mixed':
+        return _('Mixed / Custom');
+
+    default:
+        return _('Unknown');
+    }
+}
+
+
+return view.extend({
+    handleSave: null,
+    handleSaveApply: null,
+    handleReset: null,
+
+
+    load: function() {
+        return fs.exec(
+            '/usr/sbin/mwan3-mode',
+            [ 'status' ]
+        ).catch(function(err) {
+            return {
+                code: 1,
+                stdout: '',
+                stderr: String(err)
+            };
+        });
+    },
+
+
+    handleSwitch: function(mode) {
+        var label = modeLabel(mode);
+
+        ui.showModal(
+            _('Switching mode'),
+            [
+                E(
+                    'p',
+                    { 'class': 'spinning' },
+                    _('Switching to %s ...').format(label)
+                )
+            ]
+        );
+
+        return fs.exec(
+            '/usr/sbin/mwan3-mode',
+            [ mode ]
+        ).then(function(res) {
+
+            ui.hideModal();
+
+            if (!res || res.code !== 0) {
+                var output =
+                    (res && (res.stderr || res.stdout)) ||
+                    _('Unknown error');
+
+                ui.addNotification(
+                    null,
+                    E('div', {}, [
+                        E(
+                            'p',
+                            {},
+                            _('Failed to switch to %s.')
+                                .format(label)
+                        ),
+
+                        E(
+                            'pre',
+                            {
+                                'style':
+                                    'white-space:pre-wrap;' +
+                                    'margin-top:.5em;'
+                            },
+                            output
+                        )
+                    ]),
+                    'danger'
+                );
+
+                return;
+            }
+
+            ui.addNotification(
+                null,
+                E(
+                    'p',
+                    {},
+                    _('Switched to %s.').format(label)
+                ),
+                'info'
+            );
+
+            window.setTimeout(function() {
+                window.location.reload();
+            }, 500);
+
+        }).catch(function(err) {
+
+            ui.hideModal();
+
+            ui.addNotification(
+                null,
+                E(
+                    'p',
+                    {},
+                    _('Failed to switch to %s.')
+                        .format(label) +
+                    ' ' +
+                    String(err)
+                ),
+                'danger'
+            );
+        });
+    },
+
+
+    render: function(status) {
+        var output =
+            status && status.stdout
+                ? status.stdout
+                : '';
+
+        var mode = parseMode(output);
+
+        var self = this;
+
+        /*
+         * Segmented Control
+         *
+         * Interaction semantics:
+         *   radiogroup / radio
+         *
+         * Appearance:
+         *   LuCI native button classes
+         *
+         * No hard-coded colors are used, so the active theme
+         * controls the actual appearance.
+         */
+
+        var failoverButton = E(
+            'button',
+            {
+                'type': 'button',
+
+                'role': 'radio',
+
+                'aria-checked':
+                    mode === 'failover'
+                        ? 'true'
+                        : 'false',
+
+                'class':
+                    mode === 'failover'
+                        ? 'btn cbi-button-positive'
+                        : 'btn cbi-button-neutral',
+
+                'style':
+                    'margin:0;' +
+                    'border-radius:.375em 0 0 .375em;',
+
+                'click':
+                    mode === 'failover'
+                        ? function(ev) {
+                            ev.preventDefault();
+                            return false;
+                        }
+                        : ui.createHandlerFn(
+                            self,
+                            'handleSwitch',
+                            'failover'
+                        )
+            },
+
+            _('Failover')
+        );
+
+
+        var balanceButton = E(
+            'button',
+            {
+                'type': 'button',
+
+                'role': 'radio',
+
+                'aria-checked':
+                    mode === 'balance'
+                        ? 'true'
+                        : 'false',
+
+                'class':
+                    mode === 'balance'
+                        ? 'btn cbi-button-positive'
+                        : 'btn cbi-button-neutral',
+
+                'style':
+                    'margin:0;' +
+                    'margin-left:-1px;' +
+                    'border-radius:0 .375em .375em 0;',
+
+                'click':
+                    mode === 'balance'
+                        ? function(ev) {
+                            ev.preventDefault();
+                            return false;
+                        }
+                        : ui.createHandlerFn(
+                            self,
+                            'handleSwitch',
+                            'balance'
+                        )
+            },
+
+            _('Load Balancing')
+        );
+
+
+        var modeClass =
+            mode === 'failover' ||
+            mode === 'balance'
+                ? 'label success'
+                : 'label warning';
+
+
+        return E(
+            'div',
+            { 'class': 'cbi-map' },
+            [
+                E(
+                    'h2',
+                    {},
+                    _('MultiWAN Manager - Mode Switch')
+                ),
+
+                E(
+                    'div',
+                    { 'class': 'cbi-map-descr' },
+                    _(
+                        'Switch between the predefined failover and load-balancing policies.'
+                    )
+                ),
+
+                E(
+                    'div',
+                    { 'class': 'cbi-section' },
+                    [
+                        E(
+                            'h3',
+                            {},
+                            _('Current mode')
+                        ),
+
+                        E(
+                            'p',
+                            {},
+                            [
+                                E(
+                                    'span',
+                                    {
+                                        'class': modeClass
+                                    },
+                                    modeLabel(mode)
+                                )
+                            ]
+                        ),
+
+                        E(
+                            'div',
+                            {
+                                'role': 'radiogroup',
+
+                                'aria-label':
+                                    _('MultiWAN mode'),
+
+                                'style':
+                                    'display:inline-flex;' +
+                                    'align-items:stretch;' +
+                                    'margin-top:.5em;' +
+                                    'margin-bottom:1.25em;'
+                            },
+                            [
+                                failoverButton,
+                                balanceButton
+                            ]
+                        ),
+
+                        E(
+                            'div',
+                            {
+                                'class':
+                                    'cbi-section-descr'
+                            },
+                            [
+                                E(
+                                    'p',
+                                    {},
+                                    [
+                                        E(
+                                            'strong',
+                                            {},
+                                            _('Failover') + ': '
+                                        ),
+
+                                        _(
+                                            'Wired WAN is preferred. USB WAN takes over when the wired WAN fails.'
+                                        )
+                                    ]
+                                ),
+
+                                E(
+                                    'p',
+                                    {},
+                                    [
+                                        E(
+                                            'strong',
+                                            {},
+                                            _('Load Balancing') + ': '
+                                        ),
+
+                                        _(
+                                            'WAN and USB WAN are used together for connection distribution with the configured 3:1 weight.'
+                                        )
+                                    ]
+                                ),
+
+                                E(
+                                    'p',
+                                    {},
+                                    _(
+                                        'Switching updates the IPv4 default rule, HTTPS sticky rule and the configured IPv6 default rule.'
+                                    )
+                                )
+                            ]
+                        )
+                    ]
+                )
+            ]
+        );
+    }
+});
+EOF_MWAN3_MODE_VIEW
+
+    chmod 0644 "$MWAN3_MODE_VIEW"
+    chmod 0644 "$MWAN3_MODE_MENU"
+    chmod 0644 "$MWAN3_MODE_ACL"
+
+    # --------------------------------------------------------
+    # Simplified Chinese translation
+    #
+    # English strings above are the canonical msgid values.
+    # LuCI automatically uses the Chinese translations below
+    # when the UI language is Simplified Chinese.
+    # --------------------------------------------------------
+
+    if [ ! -f "$MWAN3_MODE_ZH" ]; then
+        cat > "$MWAN3_MODE_ZH" <<'EOF_MWAN3_PO_HEADER'
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+EOF_MWAN3_PO_HEADER
+    fi
+
+
+    add_mwan3_zh_translation() {
+        MSGID="$1"
+        MSGSTR="$2"
+
+        if ! grep -Fqx "msgid \"$MSGID\"" \
+            "$MWAN3_MODE_ZH"; then
+
+            printf '\nmsgid "%s"\nmsgstr "%s"\n' \
+                "$MSGID" \
+                "$MSGSTR" \
+                >> "$MWAN3_MODE_ZH"
+        fi
+    }
+
+
+    add_mwan3_zh_translation \
+        "Mode Switch" \
+        "模式切换"
+
+    add_mwan3_zh_translation \
+        "MultiWAN Manager - Mode Switch" \
+        "MultiWAN 管理器 - 模式切换"
+
+    add_mwan3_zh_translation \
+        "MultiWAN mode" \
+        "MultiWAN 模式"
+
+    add_mwan3_zh_translation \
+        "Current mode" \
+        "当前模式"
+
+    add_mwan3_zh_translation \
+        "Failover" \
+        "故障转移"
+
+    add_mwan3_zh_translation \
+        "Load Balancing" \
+        "负载均衡"
+
+    add_mwan3_zh_translation \
+        "Mixed / Custom" \
+        "混合 / 自定义"
+
+    add_mwan3_zh_translation \
+        "Unknown" \
+        "未知"
+
+    add_mwan3_zh_translation \
+        "Switching mode" \
+        "正在切换模式"
+
+    add_mwan3_zh_translation \
+        "Switching to %s ..." \
+        "正在切换到 %s……"
+
+    add_mwan3_zh_translation \
+        "Switched to %s." \
+        "已切换到 %s。"
+
+    add_mwan3_zh_translation \
+        "Failed to switch to %s." \
+        "切换到 %s 失败。"
+
+    add_mwan3_zh_translation \
+        "Unknown error" \
+        "未知错误"
+
+    add_mwan3_zh_translation \
+        "Switch between the predefined failover and load-balancing policies." \
+        "在预设的故障转移和负载均衡策略之间快速切换。"
+
+    add_mwan3_zh_translation \
+        "Wired WAN is preferred. USB WAN takes over when the wired WAN fails." \
+        "优先使用有线 WAN；有线 WAN 故障后由 USB WAN 接管。"
+
+    add_mwan3_zh_translation \
+        "WAN and USB WAN are used together for connection distribution with the configured 3:1 weight." \
+        "WAN 与 USB WAN 同时参与连接分流，并按照预设的 3:1 权重分配。"
+
+    add_mwan3_zh_translation \
+        "Switching updates the IPv4 default rule, HTTPS sticky rule and the configured IPv6 default rule." \
+        "切换会同时更新 IPv4 默认规则、HTTPS Sticky 规则以及已配置的 IPv6 默认规则。"
+
+
+    echo "OK: LuCI mwan3 mode switch page installed"
+    echo "  Network -> MultiWAN Manager -> Mode Switch"
+    echo "  Chinese UI -> 模式切换"
+
+fi
+
+
 # ============================================================
 # First-boot USB tether WAN + optional IPv6 + mwan3
 # failover / load-balancing configuration
