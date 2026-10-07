@@ -301,6 +301,32 @@ fi
 echo "OpenClash DNS compatibility check finished"
 
 # ============================================================
+# USB tether IPv6 NAT66 fallback for firewall4
+#
+# Only forwarded IPv6 traffic leaving through usb0 is
+# masqueraded.
+#
+# This intentionally does NOT enable zone-wide masq6:
+#   - native wired WAN6 IPv6 remains untouched
+#   - LAN ULA can use USB WAN6
+#   - LAN GUA learned from wired WAN6 can still survive
+#     failover to USB WAN6
+# ============================================================
+
+USBWAN6_NAT66_FILE="files/etc/usbwan6-nat66.nft"
+
+mkdir -p "$(dirname "$USBWAN6_NAT66_FILE")"
+
+cat > "$USBWAN6_NAT66_FILE" <<'EOF_USBWAN6_NAT66'
+meta nfproto ipv6 iifname "br-lan" oifname "usb0" counter masquerade comment "USB tether IPv6 NAT66 failover"
+EOF_USBWAN6_NAT66
+
+chmod 0644 "$USBWAN6_NAT66_FILE"
+
+echo "USB tether IPv6 NAT66 nftables snippet installed:"
+echo "  $USBWAN6_NAT66_FILE"
+
+# ============================================================
 # First-boot USB tether WAN + optional IPv6 + mwan3 failover
 #
 # Wired WAN:
@@ -471,11 +497,13 @@ if command -v odhcp6c >/dev/null 2>&1 &&
         uci set network.usbwan6='interface'
         uci set network.usbwan6.proto='dhcpv6'
 
-        # Reference usbwan's physical device: usb0.
-        uci set network.usbwan6.device='@usbwan'
+       # Bind directly to the physical USB tether device.
+       # This form has been verified on the target router.
+       uci set network.usbwan6.device='usb0'
 
         uci set network.usbwan6.reqaddress='try'
         uci set network.usbwan6.reqprefix='auto'
+        uci set network.usbwan6.norelease='1'
         uci set network.usbwan6.metric='20'
 
         if uci -q get network.wan6 >/dev/null 2>&1; then
@@ -494,7 +522,11 @@ fi
 #
 # Use the existing WAN zone.
 # Keep IPv4 NAT and MTU fixing enabled.
-# Do not enable NAT66 automatically.
+#
+# Do NOT enable zone-wide masq6.
+# USB-only IPv6 NAT66 is installed separately through
+# a firewall4 nftables include, so wired WAN6 can retain
+# native end-to-end IPv6.
 # ------------------------------------------------------------
 
 if ! has_list_item "firewall.$WAN_ZONE.network" usbwan; then
@@ -509,6 +541,40 @@ fi
 
 uci set "firewall.$WAN_ZONE.masq=1"
 uci set "firewall.$WAN_ZONE.mtu_fix=1"
+
+# ------------------------------------------------------------
+# USB-only IPv6 NAT66
+#
+# Do not use firewall.$WAN_ZONE.masq6=1 because the WAN zone
+# also contains wired wan6.
+#
+# The nftables rule only matches forwarded IPv6 traffic:
+#
+#   br-lan -> usb0
+#
+# Therefore:
+#   wired WAN6 -> native IPv6
+#   USB WAN6   -> NAT66
+# ------------------------------------------------------------
+
+if [ "$V6_READY" -eq 1 ] &&
+   command -v fw4 >/dev/null 2>&1 &&
+   [ -f /etc/usbwan6-nat66.nft ]; then
+
+    uci set firewall.usbwan6_nat66='include'
+    uci set firewall.usbwan6_nat66.enabled='1'
+    uci set firewall.usbwan6_nat66.type='nftables'
+    uci set firewall.usbwan6_nat66.path='/etc/usbwan6-nat66.nft'
+    uci set firewall.usbwan6_nat66.position='chain-pre'
+    uci set firewall.usbwan6_nat66.chain='srcnat'
+
+    log_msg "USB-only IPv6 NAT66 firewall4 include configured"
+
+else
+
+    log_msg "firewall4/NAT66 snippet unavailable; USB IPv6 NAT66 skipped"
+
+fi
 
 # Ensure LAN -> WAN forwarding exists without duplicating it.
 
@@ -665,8 +731,14 @@ if [ -x /etc/init.d/mwan3 ] &&
             uci set mwan3.wan6='interface'
             uci set mwan3.wan6.enabled='1'
             uci set mwan3.wan6.family='ipv6'
+            uci set mwan3.wan6.track_method='ping'
             uci set mwan3.wan6.reliability='1'
-
+              
+            uci -q delete mwan3.wan6.track_ip || true
+              
+            uci add_list mwan3.wan6.track_ip='2606:4700:4700::1111'
+            uci add_list mwan3.wan6.track_ip='2001:4860:4860::8888'
+              
             uci set mwan3.wan6_m1_w3='member'
             uci set mwan3.wan6_m1_w3.interface='wan6'
             uci set mwan3.wan6_m1_w3.metric='1'
