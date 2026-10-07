@@ -189,3 +189,113 @@ EOF
 else
     echo "OK: KIOXIA EXCERIA PLUS SMART USB bridge mapping already exists"
 fi
+
+# ============================================================
+# OpenClash DNS restore compatibility fix
+#
+# Upstream issue:
+# https://github.com/vernesong/OpenClash/issues/5321
+#
+# Fixes:
+# 1. Do not discard WAN DNS merely because it equals WAN gateway.
+# 2. Append WAN6 DNS instead of overwriting already-written WAN DNS.
+#
+# Compatibility behavior:
+# - OpenClash not present        -> skip safely
+# - Old affected code present   -> patch it
+# - Upstream already fixed      -> leave it untouched
+# - Unknown future code layout  -> warn and leave untouched
+# ============================================================
+
+echo "============================================================"
+echo " Checking OpenClash DNS restore compatibility"
+echo "============================================================"
+
+OPENCLASH_HELPER_OLD='if rv.wan[o].dns[i] ~= rv.wan[o].gwaddr and rv.wan[o].dns[i] ~= rv.wan[o].ipaddr then'
+OPENCLASH_HELPER_NEW='if rv.wan[o].dns[i] ~= rv.wan[o].ipaddr then'
+
+OPENCLASH_INIT_OLD='echo "# Interface LAN6" > "$resolv_file"'
+OPENCLASH_INIT_NEW='echo "# Interface LAN6" >> "$resolv_file"'
+
+# OpenClash may come from a feed or from package/, so search both.
+mapfile -t OPENCLASH_HELPERS < <(
+    find package feeds \
+        -type f \
+        -path '*/luci-app-openclash/root/usr/share/openclash/openclash_get_network.lua' \
+        -print 2>/dev/null
+)
+
+mapfile -t OPENCLASH_INITS < <(
+    find package feeds \
+        -type f \
+        -path '*/luci-app-openclash/root/etc/init.d/openclash' \
+        -print 2>/dev/null
+)
+
+# ------------------------------------------------------------
+# Fix 1:
+# WAN DNS == WAN gateway is valid and common on DHCP networks.
+# The affected OpenClash code incorrectly filters that DNS out.
+# ------------------------------------------------------------
+
+if [ "${#OPENCLASH_HELPERS[@]}" -eq 0 ]; then
+    echo "INFO: OpenClash network helper not found; DNS helper fix skipped"
+else
+    for OPENCLASH_HELPER in "${OPENCLASH_HELPERS[@]}"; do
+        echo "Checking: $OPENCLASH_HELPER"
+
+        if grep -Fq "$OPENCLASH_HELPER_OLD" "$OPENCLASH_HELPER"; then
+            sed -i \
+                's/if rv\.wan\[o\]\.dns\[i\] ~= rv\.wan\[o\]\.gwaddr and rv\.wan\[o\]\.dns\[i\] ~= rv\.wan\[o\]\.ipaddr then/if rv.wan[o].dns[i] ~= rv.wan[o].ipaddr then/' \
+                "$OPENCLASH_HELPER"
+
+            if grep -Fq "$OPENCLASH_HELPER_NEW" "$OPENCLASH_HELPER"; then
+                echo "OK: OpenClash WAN DNS == gateway filter bug patched"
+            else
+                echo "ERROR: OpenClash WAN DNS helper patch verification failed"
+                exit 1
+            fi
+
+        elif grep -Fq "$OPENCLASH_HELPER_NEW" "$OPENCLASH_HELPER"; then
+            echo "OK: OpenClash WAN DNS helper is already fixed; no patch needed"
+
+        else
+            echo "WARNING: OpenClash WAN DNS helper layout is unknown; leaving untouched"
+        fi
+    done
+fi
+
+# ------------------------------------------------------------
+# Fix 2:
+# WAN6 DNS must append to the resolver file, not overwrite the
+# IPv4 WAN DNS that was written immediately before it.
+# ------------------------------------------------------------
+
+if [ "${#OPENCLASH_INITS[@]}" -eq 0 ]; then
+    echo "INFO: OpenClash init script not found; WAN6 resolver fix skipped"
+else
+    for OPENCLASH_INIT in "${OPENCLASH_INITS[@]}"; do
+        echo "Checking: $OPENCLASH_INIT"
+
+        if grep -Fq "$OPENCLASH_INIT_OLD" "$OPENCLASH_INIT"; then
+            sed -i \
+                's|echo "# Interface LAN6" > "\$resolv_file"|echo "# Interface LAN6" >> "$resolv_file"|' \
+                "$OPENCLASH_INIT"
+
+            if grep -Fq "$OPENCLASH_INIT_NEW" "$OPENCLASH_INIT"; then
+                echo "OK: OpenClash WAN6 DNS overwrite bug patched"
+            else
+                echo "ERROR: OpenClash WAN6 resolver patch verification failed"
+                exit 1
+            fi
+
+        elif grep -Fq "$OPENCLASH_INIT_NEW" "$OPENCLASH_INIT"; then
+            echo "OK: OpenClash WAN6 resolver handling is already fixed; no patch needed"
+
+        else
+            echo "WARNING: OpenClash init DNS layout is unknown; leaving untouched"
+        fi
+    done
+fi
+
+echo "OpenClash DNS compatibility check finished"
