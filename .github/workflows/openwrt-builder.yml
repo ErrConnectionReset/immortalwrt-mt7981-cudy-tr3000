@@ -527,6 +527,13 @@ jobs:
             echo "✅ Module package archive created:"
             echo "   $MODULE_ARCHIVE"
 
+            # Export requested =y packages using this device's actual build metadata.
+            python3 "$GITHUB_WORKSPACE/package-export/collect.py" \
+                --build /workdir/openwrt \
+                --lists "$GITHUB_WORKSPACE/package-export" \
+                --output "$GITHUB_WORKSPACE/firmware_collection" \
+                --device "$DEV"
+
             echo "::endgroup::"
           done
 
@@ -937,6 +944,13 @@ jobs:
           # ============================================================
           # 8. Footer
           # ============================================================
+          # Append export results without changing the existing config comparison.
+          for SUMMARY in "$GITHUB_WORKSPACE"/firmware_collection/package-export-summary-*.md; do
+              [ -f "$SUMMARY" ] || continue
+              printf '\n---\n\n' >> "$GITHUB_WORKSPACE/release.txt"
+              cat "$SUMMARY" >> "$GITHUB_WORKSPACE/release.txt"
+          done
+
           {
               echo "---"
               echo

@@ -1,0 +1,5 @@
+# Export these packages only when the current device selects them as =y.
+luci-app-openclash
+luci-i18n-mwan3-zh-cn
+luci-app-mwan3
+mwan3
