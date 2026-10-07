@@ -327,7 +327,216 @@ echo "USB tether IPv6 NAT66 nftables snippet installed:"
 echo "  $USBWAN6_NAT66_FILE"
 
 # ============================================================
-# First-boot USB tether WAN + optional IPv6 + mwan3 failover
+# mwan3 mode switch helper
+#
+# Runtime commands:
+#   mwan3-mode failover
+#   mwan3-mode balance
+#   mwan3-mode status
+#
+# failover:
+#   IPv4 -> wan_usb
+#   IPv6 -> wan6_usb
+#
+# balance:
+#   IPv4 -> wan_usb_bal
+#   IPv6 -> wan6_usb_bal
+#
+# The helper changes only rule -> policy assignments.
+# Members and policies themselves remain untouched.
+# ============================================================
+
+MWAN3_MODE_HELPER="files/usr/sbin/mwan3-mode"
+
+mkdir -p "$(dirname "$MWAN3_MODE_HELPER")"
+
+cat > "$MWAN3_MODE_HELPER" <<'EOF_MWAN3_MODE'
+#!/bin/sh
+
+TAG='mwan3-mode'
+
+log_msg() {
+    logger -t "$TAG" "$*" 2>/dev/null || true
+    echo "$TAG: $*"
+}
+
+die() {
+    log_msg "ERROR: $*"
+    exit 1
+}
+
+usage() {
+    cat <<'EOF_USAGE'
+Usage:
+  mwan3-mode failover
+  mwan3-mode balance
+  mwan3-mode status
+
+Modes:
+  failover
+    IPv4: wan_usb
+    IPv6: wan6_usb
+
+  balance
+    IPv4: wan_usb_bal
+    IPv6: wan6_usb_bal
+
+  status
+    Show current mwan3 policy assignments.
+EOF_USAGE
+}
+
+command -v uci >/dev/null 2>&1 ||
+    die "uci not found"
+
+[ -f /etc/config/mwan3 ] ||
+    die "/etc/config/mwan3 not found"
+
+show_status() {
+    V4="$(uci -q get mwan3.default_rule_v4.use_policy 2>/dev/null || true)"
+    HTTPS="$(uci -q get mwan3.https.use_policy 2>/dev/null || true)"
+    V6="$(uci -q get mwan3.default_rule_v6.use_policy 2>/dev/null || true)"
+
+    echo "===== mwan3 mode status ====="
+    printf '%-20s %s\n' "default_rule_v4:" "${V4:-not configured}"
+    printf '%-20s %s\n' "https:" "${HTTPS:-not configured}"
+    printf '%-20s %s\n' "default_rule_v6:" "${V6:-not configured}"
+
+    echo
+
+    if [ "$V4" = "wan_usb" ] &&
+       { [ -z "$HTTPS" ] || [ "$HTTPS" = "wan_usb" ]; } &&
+       { [ -z "$V6" ] || [ "$V6" = "wan6_usb" ]; }; then
+
+        echo "Mode: failover"
+
+    elif [ "$V4" = "wan_usb_bal" ] &&
+         { [ -z "$HTTPS" ] || [ "$HTTPS" = "wan_usb_bal" ]; } &&
+         { [ -z "$V6" ] || [ "$V6" = "wan6_usb_bal" ]; }; then
+
+        echo "Mode: balance"
+
+    else
+        echo "Mode: mixed/custom"
+    fi
+}
+
+case "$1" in
+    failover)
+        V4_POLICY='wan_usb'
+        V6_POLICY='wan6_usb'
+        ;;
+
+    balance)
+        V4_POLICY='wan_usb_bal'
+        V6_POLICY='wan6_usb_bal'
+        ;;
+
+    status)
+        show_status
+        exit 0
+        ;;
+
+    -h|--help|help|'')
+        usage
+        exit 0
+        ;;
+
+    *)
+        usage
+        exit 2
+        ;;
+esac
+
+# ------------------------------------------------------------
+# Validate IPv4 rule and target policy.
+# IPv4 is mandatory for this helper.
+# ------------------------------------------------------------
+
+[ "$(uci -q get mwan3.default_rule_v4 2>/dev/null)" = "rule" ] ||
+    die "mwan3.default_rule_v4 does not exist"
+
+[ "$(uci -q get "mwan3.${V4_POLICY}" 2>/dev/null)" = "policy" ] ||
+    die "IPv4 target policy ${V4_POLICY} does not exist"
+
+# ------------------------------------------------------------
+# IPv6 is optional.
+#
+# If default_rule_v6 exists, its corresponding policy must
+# also exist. If IPv6 was never configured, simply skip it.
+# ------------------------------------------------------------
+
+HAVE_V6=0
+
+if [ "$(uci -q get mwan3.default_rule_v6 2>/dev/null)" = "rule" ]; then
+
+    [ "$(uci -q get "mwan3.${V6_POLICY}" 2>/dev/null)" = "policy" ] ||
+        die "IPv6 target policy ${V6_POLICY} does not exist"
+
+    HAVE_V6=1
+fi
+
+# ------------------------------------------------------------
+# Change all related rules before one single UCI commit.
+# ------------------------------------------------------------
+
+uci set "mwan3.default_rule_v4.use_policy=${V4_POLICY}" ||
+    die "failed to update default_rule_v4"
+
+# HTTPS sticky rule is optional.
+if [ "$(uci -q get mwan3.https 2>/dev/null)" = "rule" ]; then
+    uci set "mwan3.https.use_policy=${V4_POLICY}" ||
+        die "failed to update https rule"
+fi
+
+if [ "$HAVE_V6" -eq 1 ]; then
+    uci set "mwan3.default_rule_v6.use_policy=${V6_POLICY}" ||
+        die "failed to update default_rule_v6"
+fi
+
+# Commit all rule changes together.
+if ! uci commit mwan3; then
+    uci revert mwan3 >/dev/null 2>&1 || true
+    die "failed to commit mwan3 configuration"
+fi
+
+# Apply immediately.
+if [ -x /etc/init.d/mwan3 ]; then
+    if ! /etc/init.d/mwan3 restart; then
+        log_msg "WARNING: configuration was saved but mwan3 restart failed"
+        exit 1
+    fi
+else
+    log_msg "WARNING: mwan3 init script not found; configuration saved but not applied"
+    exit 1
+fi
+
+case "$1" in
+    failover)
+        log_msg "switched to failover mode"
+        ;;
+    balance)
+        log_msg "switched to load-balancing mode"
+        ;;
+esac
+
+echo
+show_status
+
+exit 0
+EOF_MWAN3_MODE
+
+chmod 0755 "$MWAN3_MODE_HELPER"
+
+echo "mwan3 mode switch helper installed:"
+echo "  /usr/sbin/mwan3-mode"
+echo "  mwan3-mode failover"
+echo "  mwan3-mode balance"
+echo "  mwan3-mode status"
+
+# ============================================================
+# First-boot USB tether WAN + optional IPv6 + mwan3
+# failover / load-balancing configuration
 #
 # Wired WAN:
 #   wan      -> eth0
@@ -819,7 +1028,7 @@ if [ -x /etc/init.d/mwan3 ] &&
 
     /etc/init.d/mwan3 enable >/dev/null 2>&1 || true
 
-    log_msg "mwan3 WAN failover configured"
+    log_msg "mwan3 WAN failover and load-balancing policies configured"
 
 else
 
