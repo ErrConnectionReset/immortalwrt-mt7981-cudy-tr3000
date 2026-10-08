@@ -48,6 +48,38 @@ def digest(path):
     return checksum.hexdigest()
 
 
+def indexed_ipks(roots, name, version, arch):
+    matches = []
+    for root in roots:
+        index = root / "Packages"
+        if not index.is_file():
+            continue
+        for block in index.read_text(encoding="utf-8").split("\n\n"):
+            fields = dict(line.split(": ", 1) for line in block.splitlines()
+                          if not line.startswith((" ", "\t")) and ": " in line)
+            if fields.get("Package") != name or fields.get("Architecture") not in (arch, "all"):
+                continue
+            actual_version = fields["Version"]
+            # LuCI deliberately emits Version: x during the metadata/DUMP phase.
+            if actual_version == "x" or (version != "x" and actual_version != version):
+                continue
+            filename = f"{name}_{actual_version}_{fields['Architecture']}.ipk"
+            if fields["Filename"] not in (filename, f"./{filename}"):
+                raise ValueError(f"unexpected indexed filename: {fields['Filename']}")
+            ipk = root / filename
+            if not ipk.is_file():
+                raise ValueError(f"indexed IPK is missing: {ipk}")
+            checksum = digest(ipk)
+            if checksum != fields["SHA256sum"]:
+                raise ValueError(f"indexed IPK checksum mismatch: {ipk}")
+            matches.append((ipk, actual_version, checksum))
+    if not matches:
+        raise ValueError(f"missing current IPK in Packages indexes: {name}_{version}_({arch}|all).ipk")
+    if len({(path.name, actual_version, checksum) for path, actual_version, checksum in matches}) != 1:
+        raise ValueError("conflicting IPK candidates in Packages indexes")
+    return matches[0]
+
+
 def collect(build, lists, output, device):
     config_path = build / ".config"
     config = {}
@@ -99,18 +131,9 @@ def collect(build, lists, output, device):
                 roots = [build / "bin/packages" / arch / info.get("Repository", "base"),
                          build / "bin/targets" / config["CONFIG_TARGET_BOARD"] /
                          config["CONFIG_TARGET_SUBTARGET"] / "packages"]
-                matches = sorted({path for root in roots for package_arch in (arch, "all")
-                                  for path in root.glob(f"{real_name}_{version}_{package_arch}.ipk")
-                                  if path.is_file()})
-                if not matches:
-                    raise ValueError(f"missing current IPK: {real_name}_{version}_({arch}|all).ipk")
-                hashes = {digest(path) for path in matches}
-                filenames = {path.name for path in matches}
-                if len(hashes) != 1 or len(filenames) != 1:
-                    raise ValueError("conflicting IPK candidates")
-                ipk = matches[0]
+                ipk, actual_version, checksum = indexed_ipks(roots, real_name, version, arch)
                 shutil.copyfile(ipk, stage / ipk.name)
-                row[2:] = ["exported", version, ipk.name, hashes.pop()]
+                row[2:] = ["exported", actual_version, ipk.name, checksum]
             except (ValueError, KeyError) as error:
                 row[2] = "error"
                 errors.append(f"{name}: {error}")
